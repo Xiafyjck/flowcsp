@@ -5,40 +5,44 @@
 import torch.nn as nn
 from typing import Dict, Optional
 import torch
+from abc import ABC, abstractmethod
 
 
-class BaseCSPNetwork(nn.Module):
+class BaseCSPNetwork(nn.Module, ABC):
     """所有CSP网络的基类 - 统一接口"""
     
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
         
+    @abstractmethod
     def forward(
-        self,
-        comp: torch.Tensor,
-        pxrd: torch.Tensor,
-        noise_level: torch.Tensor,
-        lattice: Optional[torch.Tensor] = None,
-        frac_coords: Optional[torch.Tensor] = None,
-        real_time_pxrd: Optional[torch.Tensor] = None,
+        self, 
+        z: torch.Tensor,           # [batch_size, 3+52, 3] (lattice + frac_coords)
+        t: torch.Tensor,           # [batch_size, 1] time step
+        r: torch.Tensor,           # [batch_size, 1] another time step  
+        conditions: Dict[str, torch.Tensor] # conditions including comp, pxrd, etc
     ) -> torch.Tensor:
         """
-        统一的前向传播接口 - 输出合并矩阵
+        Forward pass of the network - IMPORTANT: Do not modify this signature
         
         Args:
-            comp: 晶胞原子数量 [B, num_elements]
-            pxrd: 目标PXRD谱 [B, 11051]
-            noise_level: 噪声水平 [B, 1]
-            lattice: 晶格参数 [B, 3, 3]（可选，训练时提供）
-            frac_coords: 分数坐标 [B, max_atoms, 3]（可选，训练时提供）
-            real_time_pxrd: 实时计算的PXRD [B, 11051]（可选，采样时提供）
-            
+            z: Current state [batch_size, 3+52, 3]
+               - z[:, :3, :] are lattice vectors
+               - z[:, 3:, :] are fractional coordinates
+            t: Time step [batch_size, 1]
+            r: Another time step for flow [batch_size, 1]
+            conditions: Dictionary containing:
+                - 'comp': [batch_size, 52] atomic composition 
+                - 'pxrd': [batch_size, 11501] PXRD pattern
+                - 'pxrd_realtime': [batch_size, 11501] real-time PXRD (optional)
+                - 'num_atoms': [batch_size] number of atoms per sample
+                
         Returns:
-            output: 合并的输出矩阵 [B, 55, 3] - 前3行是晶格，后52行是分数坐标
+            Output in same shape as z: [batch_size, 3+52, 3]
         """
         raise NotImplementedError
-        
+    
     def prepare_batch(self, batch: dict) -> dict:
         """
         准备批次数据 - 子类可覆盖以进行特殊格式转换
