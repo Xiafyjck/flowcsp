@@ -132,8 +132,22 @@ class TransformerCSPNetwork(BaseCSPNetwork):
             nn.Linear(hidden_dim // 2, 3)  # Output 3D coordinates
         )
         
+        # ResNet-style MLP for condition fusion
+        # 输入: 4个条件（comp_emb, pxrd_features, t_emb, r_emb），每个都是hidden_dim维
+        self.cond_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
+        
+        # ResNet连接：将融合后的特征与原始comp_emb相加，保留重要信息
+        self.cond_residual = nn.Linear(hidden_dim, hidden_dim)
+        
         # Condition projection for adaptive normalization
-        self.cond_proj = nn.Linear(hidden_dim * 3, hidden_dim * 2)  # For scale and shift
+        self.cond_proj = nn.Linear(hidden_dim, hidden_dim * 2)  # For scale and shift
         
     def forward(
         self, 
@@ -166,6 +180,11 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         # Project input coordinates [batch_size, 55, 3] -> [batch_size, 55, hidden_dim]
         x = self.coord_proj(z)
         
+        # 调试：检查x的形状
+        if x.shape[1] != self.seq_len:
+            print(f"WARNING: x shape after proj: {x.shape}, expected seq_len: {self.seq_len}")
+            print(f"z shape: {z.shape}")
+        
         # Add type embeddings (0 for lattice, 1 for atoms)
         type_ids = torch.cat([
             torch.zeros(batch_size, 3, dtype=torch.long, device=device),
@@ -196,6 +215,10 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         # Combine all conditions
         global_cond = comp_emb + pxrd_features + t_emb + r_emb  # [batch_size, hidden_dim]
         
+        # 调试：检查维度
+        if x.dim() != 3 or global_cond.dim() != 2:
+            print(f"Shape mismatch: x={x.shape}, global_cond={global_cond.shape}")
+        
         # Add global conditioning to each position
         x = x + global_cond.unsqueeze(1)
         
@@ -208,13 +231,21 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         # Apply transformer
         x = self.transformer(x, src_key_padding_mask=mask)
         
-        # Adaptive normalization using conditions - 现在包含两个PXRD
-        cond_combined = torch.cat([comp_emb, pxrd_target_emb + pxrd_realtime_emb, t_emb + r_emb], dim=-1)
-        scale_shift = self.cond_proj(cond_combined)  # [batch_size, hidden_dim * 2]
+        # Adaptive normalization using conditions with ResNet-style fusion
+        # 步骤1: 融合所有4个条件
+        cond_combined = torch.cat([comp_emb, pxrd_features, t_emb, r_emb], dim=-1)  # [batch_size, hidden_dim * 4]
+        cond_fused = self.cond_fusion(cond_combined)  # [batch_size, hidden_dim]
+        
+        # 步骤2: ResNet残差连接 - 保留原始comp_emb信息
+        cond_final = cond_fused + self.cond_residual(comp_emb)  # [batch_size, hidden_dim]
+        
+        # 步骤3: 生成scale和shift用于adaptive normalization
+        scale_shift = self.cond_proj(cond_final)  # [batch_size, hidden_dim * 2]
         scale, shift = scale_shift.chunk(2, dim=-1)
         scale = scale.unsqueeze(1)  # [batch_size, 1, hidden_dim]
         shift = shift.unsqueeze(1)
         
+        # 步骤4: 应用adaptive normalization
         x = x * (1 + scale) + shift
         
         # Project to output space [batch_size, 55, 3]

@@ -34,11 +34,13 @@ def parse_args():
     
     # 数据参数
     parser.add_argument('--train_path', type=str, 
-                        default='data/merged_cdvae_total.pkl',
+                        default='data/merged_cdvae_train.pkl',
                         help='Path to training data')
-    parser.add_argument('--val_path', type=str, default=None,
-                        help='Path to validation data (optional, will use train if not provided)')
-    parser.add_argument('--test_path', type=str, default=None,
+    parser.add_argument('--val_path', type=str,
+                        default='data/merged_cdvae_val.pkl',
+                        help='Path to validation data')
+    parser.add_argument('--test_path', type=str,
+                        default='data/merged_cdvae_test.pkl',
                         help='Path to test data (optional)')
     parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size per GPU')
@@ -93,7 +95,7 @@ def parse_args():
                         help='T_max for CosineAnnealingLR')
     
     # 训练参数
-    parser.add_argument('--max_epochs', type=int, default=500,
+    parser.add_argument('--max_epochs', type=int, default=350,
                         help='Maximum number of epochs')
     parser.add_argument('--gradient_clip_val', type=float, default=1.0,
                         help='Gradient clipping value')

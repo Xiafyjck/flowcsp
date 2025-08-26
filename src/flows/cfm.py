@@ -139,9 +139,13 @@ class CFMFlow(BaseFlow):
         if provide_realtime.any():
             # 为部分样本提供模拟的realtime PXRD
             # 实际应用中应该计算xt的真实PXRD
-            simulated_pxrd = conditions['pxrd'] + torch.randn_like(conditions['pxrd']) * 0.1 * (1 - t.squeeze(-1).unsqueeze(-1))
+            # 注意：t的形状是[batch_size, 1]，需要正确广播
+            time_factor = (1 - t).view(batch_size, 1)  # [batch_size, 1]
+            simulated_pxrd = conditions['pxrd'] + torch.randn_like(conditions['pxrd']) * 0.1 * time_factor
             # 只为provide_realtime=1的样本设置
-            conditions['pxrd_realtime'] = simulated_pxrd * provide_realtime.unsqueeze(-1)
+            # provide_realtime的形状是[batch_size, 1]，需要广播到[batch_size, pxrd_dim]
+            mask = provide_realtime.view(batch_size, 1).expand(-1, conditions['pxrd'].shape[1])
+            conditions['pxrd_realtime'] = simulated_pxrd * mask
         else:
             conditions['pxrd_realtime'] = None
         
@@ -158,17 +162,24 @@ class CFMFlow(BaseFlow):
             mask[i, 3:3+n] = 1.0  # 有效原子位置
         mask = mask.unsqueeze(-1)  # [batch_size, 55, 1]
         
-        # 计算加权MSE损失
+        # 计算加权MSE损失 - 只对有效位置计算，避免padding影响
         # 分别计算晶格和坐标的损失
+        
+        # 晶格损失 - 晶格始终有效，直接计算MSE
         lattice_loss = F.mse_loss(
-            v_pred[:, :3] * mask[:, :3],
-            v_target[:, :3] * mask[:, :3]
+            v_pred[:, :3],
+            v_target[:, :3]
         )
         
-        coords_loss = F.mse_loss(
-            v_pred[:, 3:] * mask[:, 3:],
-            v_target[:, 3:] * mask[:, 3:]
-        )
+        # 坐标损失 - 需要处理不同原子数的情况
+        # 方法：计算每个有效位置的平方误差，然后求平均
+        coords_diff = (v_pred[:, 3:] - v_target[:, 3:]) * mask[:, 3:]  # 只保留有效位置的差值
+        coords_sq_error = (coords_diff ** 2).sum(dim=-1)  # [batch_size, 52] 每个位置的平方误差
+        
+        # 计算每个样本的有效原子数，用于正确的平均
+        valid_atoms = mask[:, 3:, 0].sum(dim=1)  # [batch_size] 每个样本的有效原子数
+        coords_loss_per_sample = coords_sq_error.sum(dim=1) / (valid_atoms * 3 + 1e-8)  # 防止除0
+        coords_loss = coords_loss_per_sample.mean()  # batch平均
         
         # 总损失
         loss = (self.loss_weight_lattice * lattice_loss + 
