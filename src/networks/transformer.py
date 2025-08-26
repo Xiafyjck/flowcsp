@@ -91,8 +91,8 @@ class TransformerCSPNetwork(BaseCSPNetwork):
             nn.Linear(512, hidden_dim)
         )
         
-        # 实时PXRD投影（采样过程中计算的当前结构PXRD）
-        self.pxrd_realtime_proj = nn.Sequential(
+        # 实时PXRD encoder（用于真实计算的PXRD，如果有）
+        self.pxrd_real_encoder = nn.Sequential(
             nn.Linear(pxrd_dim, 2048),
             nn.LayerNorm(2048),
             nn.ReLU(),
@@ -180,19 +180,21 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         comp_emb = self.comp_proj(comp)  # [batch_size, hidden_dim]
         pxrd_target_emb = self.pxrd_target_proj(pxrd_target)  # [batch_size, hidden_dim]
         
-        # 处理实时PXRD（如果提供）
+        # 处理PXRD特征融合
+        # 基础特征：总是使用目标PXRD
+        pxrd_features = pxrd_target_emb  # [batch_size, hidden_dim]
+        
+        # 如果有真实计算的PXRD，添加其特征
         if pxrd_realtime is not None:
-            pxrd_realtime_emb = self.pxrd_realtime_proj(pxrd_realtime)  # [batch_size, hidden_dim]
-        else:
-            # 如果没有实时PXRD，使用零向量或目标PXRD
-            pxrd_realtime_emb = torch.zeros_like(pxrd_target_emb)
+            pxrd_sim_emb = self.pxrd_real_encoder(pxrd_realtime)  # [batch_size, hidden_dim]
+            pxrd_features = pxrd_features + pxrd_sim_emb  # 特征融合
         
         # Time embeddings
         t_emb = self.time_emb_t(t)  # [batch_size, hidden_dim]
         r_emb = self.time_emb_r(r)  # [batch_size, hidden_dim]
         
-        # Combine all conditions - 现在包含两个PXRD的信息
-        global_cond = comp_emb + pxrd_target_emb + pxrd_realtime_emb + t_emb + r_emb  # [batch_size, hidden_dim]
+        # Combine all conditions
+        global_cond = comp_emb + pxrd_features + t_emb + r_emb  # [batch_size, hidden_dim]
         
         # Add global conditioning to each position
         x = x + global_cond.unsqueeze(1)

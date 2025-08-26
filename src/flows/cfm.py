@@ -131,9 +131,19 @@ class CFMFlow(BaseFlow):
         # 计算插值 xt
         xt = self.interpolate(x0, x1, t.unsqueeze(-1))
         
-        # 添加实时PXRD到条件（这里使用插值的结构，实际应用中应该计算xt的PXRD）
-        # 注意：训练时我们简化处理，使用目标PXRD的加权版本模拟实时PXRD
-        conditions['pxrd_realtime'] = conditions['pxrd'] * t.squeeze(-1).unsqueeze(-1)
+        # 训练时模拟realtime PXRD的可用性
+        # 早期时间步（t < 0.25）不提供realtime PXRD（结构太嘈杂）
+        # 后期时间步有一定概率提供（模拟实际计算可能失败的情况）
+        provide_realtime = (t > 0.25).float() * (torch.rand_like(t) > 0.3)  # 70%概率在后期提供
+        
+        if provide_realtime.any():
+            # 为部分样本提供模拟的realtime PXRD
+            # 实际应用中应该计算xt的真实PXRD
+            simulated_pxrd = conditions['pxrd'] + torch.randn_like(conditions['pxrd']) * 0.1 * (1 - t.squeeze(-1).unsqueeze(-1))
+            # 只为provide_realtime=1的样本设置
+            conditions['pxrd_realtime'] = simulated_pxrd * provide_realtime.unsqueeze(-1)
+        else:
+            conditions['pxrd_realtime'] = None
         
         # 通过网络预测速度场
         v_pred = self.network(xt, t, r, conditions)
@@ -340,45 +350,62 @@ class CFMFlow(BaseFlow):
             t = torch.full((batch_size, 1), step * dt, device=device)
             r = t.clone()
             
-            # 尝试计算当前结构的PXRD
-            try:
-                # 将当前状态转换为晶体结构（需要先反归一化到物理空间）
-                x_physical = self.normalizer.denormalize_z(x.detach())
-                lattice = x_physical[:, :3].cpu().numpy()
-                frac_coords = x_physical[:, 3:].cpu().numpy()
-                comp = conditions['comp'].cpu().numpy()
-                num_atoms = conditions['num_atoms'].cpu().numpy()
-                
-                # 计算实时PXRD（批量计算）
-                realtime_pxrd = []
-                for i in range(batch_size):
-                    try:
-                        # 这里应该调用pxrd_simulator
-                        # 暂时使用插值模拟
-                        pxrd_i = target_pxrd[i] * (step / num_steps)
-                        realtime_pxrd.append(pxrd_i)
-                    except:
-                        # 如果计算失败，使用零向量
-                        realtime_pxrd.append(torch.zeros_like(target_pxrd[i]))
-                
-                realtime_pxrd = torch.stack(realtime_pxrd).to(device)
-                conditions['pxrd_realtime'] = realtime_pxrd
-                
-            except:
-                # 如果无法计算PXRD，使用简化版本
-                conditions['pxrd_realtime'] = target_pxrd * t.squeeze(-1).unsqueeze(-1)
+            # 尝试计算当前结构的真实PXRD
+            # 早期阶段（前25%）不尝试计算，因为结构太嘈杂
+            if step > num_steps // 4:
+                try:
+                    # 将当前状态转换为晶体结构（需要先反归一化到物理空间）
+                    x_physical = self.normalizer.denormalize_z(x.detach())
+                    lattice = x_physical[:, :3].cpu().numpy()
+                    frac_coords = x_physical[:, 3:].cpu().numpy()
+                    comp = conditions['comp'].cpu().numpy()
+                    num_atoms = conditions['num_atoms'].cpu().numpy()
+                    
+                    # 计算实时PXRD（批量计算）
+                    realtime_pxrd = []
+                    success_mask = []
+                    
+                    for i in range(batch_size):
+                        try:
+                            # TODO: 真正调用pxrd_simulator
+                            # structure = create_structure(lattice[i], frac_coords[i][:num_atoms[i]], comp[i][:num_atoms[i]])
+                            # _, pxrd_i = pxrd_simulator.simulate(structure)
+                            # 暂时模拟：后期阶段假设能计算
+                            if step > num_steps // 2:
+                                # 模拟成功计算（实际应该调用simulator）
+                                pxrd_i = target_pxrd[i] * 0.8 + torch.randn_like(target_pxrd[i]) * 0.2
+                                realtime_pxrd.append(pxrd_i)
+                                success_mask.append(True)
+                            else:
+                                realtime_pxrd.append(None)
+                                success_mask.append(False)
+                        except:
+                            realtime_pxrd.append(None)
+                            success_mask.append(False)
+                    
+                    # 只有当有成功计算的PXRD时才设置
+                    if any(success_mask):
+                        # 对于失败的样本，不提供realtime PXRD
+                        processed_pxrd = torch.zeros(batch_size, target_pxrd.shape[1], device=device)
+                        for i, (success, pxrd) in enumerate(zip(success_mask, realtime_pxrd)):
+                            if success and pxrd is not None:
+                                processed_pxrd[i] = pxrd
+                        
+                        # 只为成功的样本提供realtime PXRD
+                        conditions['pxrd_realtime'] = processed_pxrd if any(success_mask) else None
+                    else:
+                        conditions['pxrd_realtime'] = None
+                except:
+                    # 计算失败，不提供realtime PXRD
+                    conditions['pxrd_realtime'] = None
+            else:
+                # 早期阶段不提供realtime PXRD
+                conditions['pxrd_realtime'] = None
             
             # 预测速度场
             with torch.no_grad():
                 v = self.network(x, t, r, conditions)
-                
-                # 添加PXRD引导项（梯度下降方向）
-                if step > num_steps // 4:  # 只在后期添加引导
-                    pxrd_diff = realtime_pxrd - target_pxrd
-                    pxrd_grad = torch.zeros_like(x)
-                    # 简化：假设PXRD误差主要影响晶格参数
-                    pxrd_grad[:, :3] = -pxrd_weight * pxrd_diff.mean(dim=-1, keepdim=True).unsqueeze(-1) * x[:, :3]
-                    v = v + pxrd_grad
+                # 不再需要显式的PXRD引导项，因为网络通过encoder融合自动学习引导
             
             # Euler步进
             x = x + v * dt
