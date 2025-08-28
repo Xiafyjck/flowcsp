@@ -1,29 +1,15 @@
 """
-CSV+LMDB混合数据加载模块
-- CSV存储原始数据（id和cif）
-- LMDB作为处理后数据的缓存
-- 首次访问时实时预处理并缓存
+Data loading module for crystal structure generation
+Handles pickle format from preprocessing
 """
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
-import lmdb
 import pickle
-import warnings
 from typing import Dict, Optional, Tuple, List
 from pathlib import Path
-import os
-from pymatgen.core.structure import Structure
-from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-import msgpack
-import msgpack_numpy as m
-m.patch()  # 让msgpack支持numpy数组
-
-# 导入PXRD模拟器
-from .pxrd_simulator import PXRDSimulator
-
 
 class SO3Augmentation:
     """
@@ -77,6 +63,7 @@ class SO3Augmentation:
         R = I + torch.sin(angle) * K + (1 - torch.cos(angle)) * K @ K
         
         return R
+    
     
     def apply_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -164,6 +151,23 @@ class PermutationAugmentation:
                 groups[atom_type].append(i)
         return groups
     
+    def _create_permutation_matrix(self, n: int, perm: torch.Tensor) -> torch.Tensor:
+        """
+        创建置换矩阵
+        使用F.one_hot实现，更简洁高效
+        
+        Args:
+            n: 矩阵维度
+            perm: 置换索引向量
+            
+        Returns:
+            置换矩阵 [n, n]
+        """
+        # 使用one_hot创建置换矩阵，符合CLAUDE.md的建议
+        import torch.nn.functional as F
+        perm_matrix = F.one_hot(perm, num_classes=n).float()
+        return perm_matrix
+    
     def apply_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         对batch应用置换增强
@@ -217,151 +221,70 @@ class PermutationAugmentation:
         return self.apply_batch(batch)
 
 
-class CSVLMDBDataset(Dataset):
+class CrystalDataset(Dataset):
     """
-    CSV+LMDB混合数据集
-    - CSV文件只包含id和cif列
-    - 首次访问时实时预处理并缓存到LMDB
-    - 后续访问直接从LMDB读取
+    Dataset for crystal structures with PXRD patterns
+    Loads preprocessed pickle files
     """
     
     def __init__(
         self,
-        csv_path: str,
-        lmdb_path: Optional[str] = None,
+        data_path: str,
         max_atoms: int = 60,
         pxrd_dim: int = 11501,
-        transform = None,
-        readonly: bool = False,
-        map_size: int = 100 * 1024**3,  # 100GB
-        id_col: str = 'material_id',  # ID列名
-        cif_col: str = 'cif',  # CIF列名
+        transform = None
     ):
         """
         Args:
-            csv_path: CSV文件路径
-            lmdb_path: LMDB缓存路径，默认为csv文件同目录同名.lmdb
-            max_atoms: 最大原子数量（用于padding）
-            pxrd_dim: PXRD维度
-            transform: 可选的数据变换
-            readonly: 是否只读模式（推理时使用）
-            map_size: LMDB最大空间
-            id_col: CSV中的ID列名，默认'material_id'
-            cif_col: CSV中的CIF列名，默认'cif'
+            data_path: Path to pickle file
+            max_atoms: Maximum number of atoms (for padding)
+            pxrd_dim: Dimension of PXRD pattern
+            use_niggli: Use Niggli reduced cell (True) or primitive cell (False)
+            transform: Optional data transformation
         """
-        self.id_col = id_col
-        self.cif_col = cif_col
-        self.csv_path = csv_path
         self.max_atoms = max_atoms
         self.pxrd_dim = pxrd_dim
         self.transform = transform
-        self.readonly = readonly
         
-        # LMDB路径默认设置
-        if lmdb_path is None:
-            lmdb_path = csv_path.replace('.csv', '.lmdb')
-        self.lmdb_path = lmdb_path
+        # Load data
+        print(f"Loading data from {data_path}...")
+        with open(data_path, 'rb') as f:
+            self.data = pickle.load(f)
         
-        # 读取CSV索引（只读取id列用于索引）
-        print(f"加载CSV索引: {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        self.length = len(self.df)
-        print(f"数据集大小: {self.length}")
+        # Convert to list if DataFrame
+        if isinstance(self.data, pd.DataFrame):
+            self.data = self.data.to_dict('records')
         
-        # 初始化LMDB环境
-        self.env = lmdb.open(
-            lmdb_path,
-            map_size=map_size,
-            readonly=readonly,
-            metasync=False,  # 提升写入性能
-            sync=False,      # 提升写入性能
-            writemap=True,   # 零拷贝写入
-            readahead=True,  # 预读优化
-            meminit=False,   # 不初始化内存
-            lock=False       # 单机训练可关闭锁
-        )
+        original_count = len(self.data)
         
-        # 检查缓存版本（用于判断是否需要清空缓存）
-        self._check_cache_version()
+        # 过滤掉原子数超过max_atoms的样品
+        filtered_data = []
+        for sample in self.data:
+            # 获取结构来检查原子数
+            structure = sample.get('niggli_structure')
+            if structure is not None:
+                num_atoms = len(structure)
+                if num_atoms <= max_atoms:
+                    filtered_data.append(sample)
         
-        # 初始化PXRD模拟器（实时预处理时使用）
-        self.pxrd_simulator = PXRDSimulator()
+        self.data = filtered_data
+        filtered_count = len(self.data)
         
-    def _check_cache_version(self):
-        """检查缓存版本，如果CSV更新则清空缓存"""
-        csv_mtime = os.path.getmtime(self.csv_path)
+        if filtered_count < original_count:
+            print(f"⚠️ 过滤了 {original_count - filtered_count} 个原子数超过 {max_atoms} 的样品")
         
-        with self.env.begin() as txn:
-            stored_mtime = txn.get(b'__csv_mtime__')
-            if stored_mtime is None or float(stored_mtime) < csv_mtime:
-                if not self.readonly:
-                    print("CSV文件已更新，清空缓存...")
-                    # 存储新的修改时间
-                    with self.env.begin(write=True) as write_txn:
-                        write_txn.put(b'__csv_mtime__', str(csv_mtime).encode())
-    
-    def _preprocess_cif(self, cif_str: str, sample_id: str) -> Optional[Dict]:
-        """
-        实时预处理CIF字符串
-        参考scripts/preprocess.py的逻辑
+        print(f"Loaded {filtered_count} samples (original: {original_count})")
         
-        Args:
-            cif_str: CIF格式字符串
-            sample_id: 样本ID（用于错误提示）
-            
-        Returns:
-            预处理后的数据字典，失败返回None
-        """
-        # 忽略pymatgen的CIF解析警告
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Issues encountered while parsing CIF")
-            warnings.filterwarnings("ignore", category=UserWarning)
-            
-            try:
-                # 解析CIF获取结构
-                structure = Structure.from_str(cif_str, fmt="cif")
-                
-                # 获取Niggli reduced结构
-                niggli_structure = structure.get_reduced_structure()
-                
-                # 模拟PXRD（最耗时的操作）
-                _, pxrd = self.pxrd_simulator.simulate(niggli_structure)
-                
-                # 提取必要的数据
-                lattice_matrix = np.array(niggli_structure.lattice.matrix, dtype=np.float32)  # [3, 3]
-                frac_coords = np.array(niggli_structure.frac_coords, dtype=np.float32)  # [num_atoms, 3]
-                atom_types = np.array([site.specie.Z for site in niggli_structure], dtype=np.int8)  # 使用int8节省空间
-                num_atoms = len(atom_types)
-                
-                # 检查原子数是否超过限制
-                if num_atoms > self.max_atoms:
-                    print(f"警告: 样本 {sample_id} 原子数 {num_atoms} 超过限制 {self.max_atoms}，跳过")
-                    return None
-                
-                # 返回处理后的数据（只包含必要信息）
-                return {
-                    'lattice': lattice_matrix,      # [3, 3]
-                    'frac_coords': frac_coords,      # [num_atoms, 3]
-                    'atom_types': atom_types,        # [num_atoms]
-                    'pxrd': pxrd.astype(np.float32), # [11501]
-                    'num_atoms': num_atoms,
-                    'id': sample_id
-                }
-                
-            except Exception as e:
-                print(f"处理 {sample_id} 时出错: {e}")
-                return None
+        # Verify first sample
+        if len(self.data) > 0:
+            sample = self.data[0]
+            print(f"Sample keys: {list(sample.keys())}")
     
     def __len__(self):
-        return self.length
+        return len(self.data)
     
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         """
-        获取数据
-        1. 先尝试从LMDB缓存读取
-        2. 如果缓存未命中，从CSV读取CIF并实时预处理
-        3. 将处理结果存入LMDB缓存
-        
         Returns:
             Dictionary containing:
                 - z: Combined lattice and fractional coordinates [63, 3]
@@ -369,114 +292,53 @@ class CSVLMDBDataset(Dataset):
                 - pxrd: PXRD pattern [11501]
                 - num_atoms: Number of actual atoms (scalar)
                 - atom_types: Atomic numbers [60]
-                - id: Sample ID
         """
-        # 获取样本ID
-        row = self.df.iloc[idx]
-        sample_id = str(row[self.id_col])
+        sample = self.data[idx]
         
-        # 1. 尝试从LMDB读取缓存
-        cache_key = sample_id.encode()
-        with self.env.begin() as txn:
-            cached_data = txn.get(cache_key)
-            
-        if cached_data is not None:
-            # 缓存命中，解析数据
-            data = msgpack.unpackb(cached_data, raw=False)
-        else:
-            # 2. 缓存未命中，实时预处理
-            cif_str = row[self.cif_col]
-            data = self._preprocess_cif(cif_str, sample_id)
-            
-            if data is None:
-                # 预处理失败，返回空数据或跳过
-                raise ValueError(f"无法处理样本 {sample_id}")
-            
-            # 3. 存入LMDB缓存（如果不是只读模式）
-            if not self.readonly:
-                try:
-                    with self.env.begin(write=True) as txn:
-                        # 使用msgpack序列化（比pickle更快更小）
-                        packed_data = msgpack.packb(data, use_bin_type=True)
-                        txn.put(cache_key, packed_data)
-                except lmdb.MapFullError:
-                    print(f"警告: LMDB空间已满，无法缓存样本 {sample_id}")
+        # Choose structure type
+        structure = sample['niggli_structure']
         
-        # 4. 构造输出张量
-        # 准备padding后的数据
+        # Extract data
+        lattice_matrix = np.array(structure.lattice.matrix, dtype=np.float32)  # [3, 3]
+        frac_coords = np.array(structure.frac_coords, dtype=np.float32)  # [num_atoms, 3]
+        atom_types = np.array([site.specie.Z for site in structure], dtype=np.int32)  # [num_atoms]
+        num_atoms = len(atom_types)
+        pxrd = sample['pxrd'].astype(np.float32)  # [11501]
+        
+        # Pad fractional coordinates and atom types to max_atoms
         padded_frac_coords = np.zeros((self.max_atoms, 3), dtype=np.float32)
         padded_atom_types = np.zeros(self.max_atoms, dtype=np.int32)
         
-        num_atoms = data['num_atoms']
+        # 由于已经在加载时过滤，这里num_atoms一定 <= max_atoms
         if num_atoms > 0:
-            padded_frac_coords[:num_atoms] = data['frac_coords']
-            padded_atom_types[:num_atoms] = data['atom_types']
+            padded_frac_coords[:num_atoms] = frac_coords
+            padded_atom_types[:num_atoms] = atom_types
         
-        # 创建composition向量（原子序数）
+        # Create composition vector (atomic numbers at each position)
         comp = padded_atom_types.astype(np.float32)
         
-        # 合并晶格和坐标为单个矩阵z
-        z = np.concatenate([data['lattice'], padded_frac_coords], axis=0)  # [63, 3]
+        # Combine lattice and coordinates into single matrix z
+        z = np.concatenate([lattice_matrix, padded_frac_coords], axis=0)  # [63, 3]
         
-        # 转换为PyTorch张量
+        # Convert to tensors
         output = {
             'z': torch.from_numpy(z),
             'comp': torch.from_numpy(comp),
-            'pxrd': torch.from_numpy(data['pxrd']),
-            'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
+            'pxrd': torch.from_numpy(pxrd),
+            'num_atoms': torch.tensor(num_atoms, dtype=torch.long),  # 现在可以安全使用原始值
             'atom_types': torch.from_numpy(padded_atom_types),
-            'id': data['id']
+            'id': str(sample.get('id', idx))
         }
         
-        # 应用transform（如果有）
+        # Apply transform if provided
         if self.transform:
             output = self.transform(output)
         
         return output
-    
-    def get_cache_stats(self):
-        """获取缓存统计信息"""
-        with self.env.begin() as txn:
-            stats = txn.stat()
-            entries = stats['entries'] - 1  # 减去元数据项
-            size_gb = stats['psize'] * stats['leaf_pages'] / 1024**3
-            
-        return {
-            'cached_samples': entries,
-            'total_samples': self.length,
-            'cache_ratio': entries / self.length if self.length > 0 else 0,
-            'cache_size_gb': size_gb
-        }
-    
-    def warmup_cache(self, indices=None, verbose=True):
-        """
-        预热缓存（可选）
-        
-        Args:
-            indices: 要预热的索引列表，None表示预热前1000个
-            verbose: 是否显示进度
-        """
-        if self.readonly:
-            print("只读模式，跳过缓存预热")
-            return
-            
-        if indices is None:
-            indices = range(min(1000, len(self)))
-        
-        if verbose:
-            from tqdm import tqdm
-            indices = tqdm(indices, desc="预热缓存")
-        
-        for idx in indices:
-            try:
-                _ = self[idx]
-            except Exception as e:
-                if verbose:
-                    print(f"预热索引 {idx} 失败: {e}")
 
 
 def collate_crystal_batch(
-    batch,
+    batch, 
     permutation_aug: Optional[PermutationAugmentation] = None,
     so3_aug: Optional[SO3Augmentation] = None
 ):
@@ -520,7 +382,7 @@ def collate_crystal_batch(
 
 
 def get_dataloader(
-    csv_path: str,
+    data_path: str,
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
@@ -529,55 +391,36 @@ def get_dataloader(
     augment_so3: bool = False,
     augment_prob: float = 0.5,
     so3_augment_prob: float = 0.5,
-    lmdb_path: Optional[str] = None,
-    readonly: bool = False,
-    id_col: str = 'material_id',
-    cif_col: str = 'cif',
     **dataset_kwargs
 ) -> DataLoader:
     """
-    创建数据加载器
+    Create dataloader with optional augmentations
     
     Args:
-        csv_path: CSV文件路径
-        batch_size: 批次大小
-        shuffle: 是否打乱数据
-        num_workers: 数据加载进程数
-        pin_memory: 是否固定内存
-        augment_permutation: 是否应用置换增强
-        augment_so3: 是否应用SO3增强
-        augment_prob: 置换增强概率
-        so3_augment_prob: SO3增强概率
-        lmdb_path: LMDB缓存路径
-        readonly: 是否只读模式
-        **dataset_kwargs: 其他数据集参数
+        data_path: Path to pickle file
+        batch_size: Batch size
+        shuffle: Whether to shuffle data
+        num_workers: Number of data loading workers
+        pin_memory: Whether to pin memory for GPU transfer
+        augment_permutation: Whether to apply permutation augmentation
+        augment_so3: Whether to apply SO3 augmentation
+        augment_prob: Probability of applying permutation augmentation
+        so3_augment_prob: Probability of applying SO3 augmentation
+        **dataset_kwargs: Additional arguments for CrystalDataset
     
     Returns:
-        DataLoader实例
+        DataLoader instance with optional augmentations
     """
-    # 创建数据集
-    dataset = CSVLMDBDataset(
-        csv_path=csv_path,
-        lmdb_path=lmdb_path,
-        readonly=readonly,
-        id_col=id_col,
-        cif_col=cif_col,
-        **dataset_kwargs
-    )
+    dataset = CrystalDataset(data_path, **dataset_kwargs)
     
-    # 打印缓存统计
-    stats = dataset.get_cache_stats()
-    print(f"缓存统计: {stats['cached_samples']}/{stats['total_samples']} "
-          f"({stats['cache_ratio']:.1%}), 大小: {stats['cache_size_gb']:.2f}GB")
-    
-    # 创建数据增强实例
+    # 创建数据增强实例（如果需要）
     permutation_aug = PermutationAugmentation(augment_prob=augment_prob) if augment_permutation else None
     so3_aug = SO3Augmentation(augment_prob=so3_augment_prob) if augment_so3 else None
     
-    # 创建collate函数
+    # 创建带有增强的collate函数
     def collate_fn(batch):
         return collate_crystal_batch(
-            batch,
+            batch, 
             permutation_aug=permutation_aug,
             so3_aug=so3_aug
         )
@@ -589,27 +432,26 @@ def get_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_fn,
-        persistent_workers=True if num_workers > 0 else False  # 保持worker进程
+        collate_fn=collate_fn
     )
     
     return dataloader
 
 
 def split_dataset(
-    dataset: CSVLMDBDataset,
+    dataset: CrystalDataset,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     seed: int = 42
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
-    将数据集分割为训练/验证/测试集
+    Split dataset into train/val/test
     
     Args:
-        dataset: CSVLMDBDataset实例
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        seed: 随机种子
+        dataset: CrystalDataset instance
+        train_ratio: Ratio for training set
+        val_ratio: Ratio for validation set
+        seed: Random seed for splitting
     
     Returns:
         train_dataset, val_dataset, test_dataset
