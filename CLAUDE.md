@@ -66,6 +66,8 @@
 
 - [ ] 遇到训练NaN问题，可以用用PyTorch的异常检测定位： torch.autograd.set_detect_anomaly(True) 或环境变量：TORCH_ANOMALY_ENABLED=1
 
+- [ ] 目前我搜集的训练数据集太大了，所以为了训练方便，我写了warmup脚本，把数据转换成npz格式
+
 ## 先跑通整个pipeline，后优化
 
 - 舍弃配置管理，不引入任何 hydra 和 python-dotenv 代码，默认硬编码 + 命令行参数即可

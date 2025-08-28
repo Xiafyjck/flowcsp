@@ -109,7 +109,7 @@ def main():
     parser.add_argument('--output_dir', type=str,
                        default='/home/ma-user/work/mincycle4csp/data/full_mp_cache',
                        help='输出目录路径')
-    parser.add_argument('--id_col', type=str, default='extra_id',
+    parser.add_argument('--id_col', type=str, default='id',
                        help='ID列名')
     parser.add_argument('--cif_col', type=str, default='cif',
                        help='CIF列名')
