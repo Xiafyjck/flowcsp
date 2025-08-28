@@ -48,7 +48,7 @@ def parse_args():
                         help='Path to test memmap cache directory (optional)')
     parser.add_argument('--batch_size', type=int, default=32,  # 减小batch size提高稳定性
                         help='Batch size per GPU')
-    parser.add_argument('--num_workers', type=int, default=8,  # 增加到8个，充分利用多核CPU
+    parser.add_argument('--num_workers', type=int, default=16,  # 增加到8个，充分利用多核CPU
                         help='Number of data loading workers')
     parser.add_argument('--no_augment_permutation', action='store_true',
                         help='Disable permutation data augmentation for atoms')

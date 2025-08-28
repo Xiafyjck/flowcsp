@@ -9,6 +9,7 @@ import numpy as np
 import json
 from typing import Dict, Optional, Tuple, List
 from pathlib import Path
+import time
 
 
 class SO3Augmentation:
@@ -131,7 +132,7 @@ class PermutationAugmentation:
 class CrystalDataset(Dataset):
     """
     晶体结构数据集 - 仅支持npz格式
-    使用fp16存储PXRD以节省内存
+    使用fp16存储PXRD以节省内存，初始化时一次性加载所有数据到内存
     """
     
     def __init__(
@@ -154,7 +155,7 @@ class CrystalDataset(Dataset):
         self.pxrd_dim = pxrd_dim
         self.transform = transform
         self.data_path = Path(data_path)
-        self.cache_in_memory = cache_in_memory
+        self.cache_in_memory = True or cache_in_memory
         
         # 验证路径
         if not self.data_path.exists():
@@ -190,44 +191,82 @@ class CrystalDataset(Dataset):
         if len(self.batch_files) == 0:
             raise FileNotFoundError(f"找不到批次文件 (batch_*.npz) in {self.data_path}")
         
-        # 创建索引映射（样本索引 -> (批次文件索引, 批次内索引)）
-        self.index_map = []
-        for batch_idx, batch_file in enumerate(self.batch_files):
-            # 获取该批次的样本数
-            with np.load(batch_file) as data:
-                batch_samples = len(data['z'])
-            for sample_idx in range(batch_samples):
-                self.index_map.append((batch_idx, sample_idx))
-        
-        # 内存缓存
-        self.cache = {} if cache_in_memory else None
-        
         print(f"Loading npz dataset from {self.data_path}...")
         print(f"  Samples: {self.n_samples}")
         print(f"  Batches: {len(self.batch_files)}")
-        print(f"  PXRD format: fp16 (memory-efficient)")
         
-        # 显示内存信息
-        pxrd_dtype = self.metadata.get('pxrd_dtype', 'float16')
-        if pxrd_dtype == 'float16':
-            pxrd_size = self.n_samples * 11501 * 2 / (1024**3)
-            print(f"  PXRD memory: ~{pxrd_size:.2f} GB (fp16)")
+        # 一次性加载所有数据到内存
+        if self.cache_in_memory:
+            print(f"  Loading all data into memory...")
+            start_time = time.time()
+            
+            # 初始化存储所有数据的列表
+            all_z = []
+            all_comp = []
+            all_atom_types = []
+            all_pxrd = []
+            all_num_atoms = []
+            all_ids = []
+            
+            # 加载所有批次文件
+            for i, batch_file in enumerate(self.batch_files):
+                with np.load(batch_file) as data:
+                    all_z.append(data['z'])
+                    all_comp.append(data['comp'])
+                    all_atom_types.append(data['atom_types'])
+                    all_pxrd.append(data['pxrd'])  # 保持fp16格式
+                    all_num_atoms.append(data['num_atoms'])
+                    if 'ids' in data:
+                        all_ids.extend(data['ids'])
+                
+                # 打印进度
+                if (i + 1) % 10 == 0 or (i + 1) == len(self.batch_files):
+                    print(f"    Loaded {i+1}/{len(self.batch_files)} batches...")
+            
+            # 合并所有批次为单个numpy数组
+            self.all_data = {
+                'z': np.concatenate(all_z, axis=0),
+                'comp': np.concatenate(all_comp, axis=0),
+                'atom_types': np.concatenate(all_atom_types, axis=0),
+                'pxrd': np.concatenate(all_pxrd, axis=0),  # 保持fp16格式
+                'num_atoms': np.concatenate(all_num_atoms, axis=0)
+            }
+            
+            # 处理IDs
+            if all_ids:
+                self.all_data['ids'] = np.array(all_ids)
+            else:
+                self.all_data['ids'] = np.array([str(i) for i in range(self.n_samples)])
+            
+            # 计算加载时间
+            load_time = time.time() - start_time
+            
+            # 显示内存使用信息
+            total_memory = 0
+            for key, arr in self.all_data.items():
+                if key != 'ids':
+                    memory_gb = arr.nbytes / (1024**3)
+                    total_memory += memory_gb
+                    print(f"    {key}: {arr.shape} {arr.dtype} ({memory_gb:.3f} GB)")
+            
+            print(f"  Total memory usage: {total_memory:.3f} GB")
+            print(f"  Loading time: {load_time:.2f} seconds")
+        else:
+            # 不使用内存缓存时，保持原有的延迟加载逻辑
+            self.all_data = None
+            print(f"  Using lazy loading mode (cache_in_memory=False)")
+            
+            # 创建索引映射（样本索引 -> (批次文件索引, 批次内索引)）
+            self.index_map = []
+            for batch_idx, batch_file in enumerate(self.batch_files):
+                # 获取该批次的样本数
+                with np.load(batch_file) as data:
+                    batch_samples = len(data['z'])
+                for sample_idx in range(batch_samples):
+                    self.index_map.append((batch_idx, sample_idx))
     
     def __len__(self):
-        return len(self.index_map)
-    
-    def _load_batch(self, batch_idx: int) -> Dict:
-        """加载一个批次的数据"""
-        if self.cache is not None and batch_idx in self.cache:
-            return self.cache[batch_idx]
-        
-        batch_file = self.batch_files[batch_idx]
-        batch_data = np.load(batch_file)
-        
-        if self.cache is not None:
-            self.cache[batch_idx] = batch_data
-        
-        return batch_data
+        return self.n_samples
     
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         """
@@ -240,34 +279,51 @@ class CrystalDataset(Dataset):
                 - atom_types: 原子类型 [60]
                 - id: 样本ID
         """
-        # 获取批次索引和批次内索引
-        batch_idx, sample_idx = self.index_map[idx]
-        
-        # 加载批次数据
-        batch_data = self._load_batch(batch_idx)
-        
-        # 提取样本数据
-        z = batch_data['z'][sample_idx].copy()
-        comp = batch_data['comp'][sample_idx].copy()
-        atom_types = batch_data['atom_types'][sample_idx].copy()
-        pxrd = batch_data['pxrd'][sample_idx].copy()  # fp16格式
-        num_atoms = int(batch_data['num_atoms'][sample_idx])
-        
-        # 获取ID
-        if 'ids' in batch_data:
-            sample_id = str(batch_data['ids'][sample_idx])
+        if self.cache_in_memory:
+            # 从内存中直接读取数据
+            z = self.all_data['z'][idx]
+            comp = self.all_data['comp'][idx]
+            atom_types = self.all_data['atom_types'][idx]
+            pxrd = self.all_data['pxrd'][idx]  # fp16格式
+            num_atoms = int(self.all_data['num_atoms'][idx])
+            sample_id = str(self.all_data['ids'][idx])
+            
+            # 转换为tensor
+            output = {
+                'z': torch.from_numpy(z.copy()),
+                'comp': torch.from_numpy(comp.copy()),
+                'pxrd': torch.from_numpy(pxrd.astype(np.float32)),  # fp16 -> fp32
+                'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
+                'atom_types': torch.from_numpy(atom_types.copy()),
+                'id': sample_id
+            }
         else:
-            sample_id = self.ids[idx] if idx < len(self.ids) else str(idx)
-        
-        # 转换为tensor
-        output = {
-            'z': torch.from_numpy(z),
-            'comp': torch.from_numpy(comp),
-            'pxrd': torch.from_numpy(pxrd.astype(np.float32)),  # fp16 -> fp32
-            'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
-            'atom_types': torch.from_numpy(atom_types),
-            'id': sample_id
-        }
+            # 延迟加载模式（从文件读取）
+            batch_idx, sample_idx = self.index_map[idx]
+            batch_file = self.batch_files[batch_idx]
+            
+            with np.load(batch_file) as data:
+                z = data['z'][sample_idx]
+                comp = data['comp'][sample_idx]
+                atom_types = data['atom_types'][sample_idx]
+                pxrd = data['pxrd'][sample_idx]  # fp16格式
+                num_atoms = int(data['num_atoms'][sample_idx])
+                
+                # 获取ID
+                if 'ids' in data:
+                    sample_id = str(data['ids'][sample_idx])
+                else:
+                    sample_id = self.ids[idx] if idx < len(self.ids) else str(idx)
+            
+            # 转换为tensor
+            output = {
+                'z': torch.from_numpy(z.copy()),
+                'comp': torch.from_numpy(comp.copy()),
+                'pxrd': torch.from_numpy(pxrd.astype(np.float32)),  # fp16 -> fp32
+                'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
+                'atom_types': torch.from_numpy(atom_types.copy()),
+                'id': sample_id
+            }
         
         # 应用可选的变换
         if self.transform:
