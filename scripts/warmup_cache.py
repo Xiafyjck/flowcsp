@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Warmup缓存生成脚本
-将CDVAE的CSV格式转换为内存映射的NumPy数组，支持大规模数据集和多进程访问
+将CSV格式转换为npz格式，使用fp16存储PXRD以节省内存
 """
 
 import sys
@@ -16,13 +16,12 @@ import argparse
 from src.pxrd_simulator import PXRDSimulator
 from multiprocessing import Pool, cpu_count
 import warnings
-import json
 from pathlib import Path
 
 
-def process_single_sample(row_data):
+def process_single_sample(args):
     """处理单个样本的函数（用于并行处理）"""
-    idx, material_id, cif = row_data
+    idx, material_id, cif = args
     
     # 忽略pymatgen的CIF解析警告
     with warnings.catch_warnings():
@@ -44,9 +43,10 @@ def process_single_sample(row_data):
             if num_atoms > 60:
                 return None
             
-            # 模拟PXRD
+            # 模拟PXRD - 使用fp16存储以节省内存
             pxrd_simulator = PXRDSimulator()
             _, pxrd = pxrd_simulator.simulate(structure)
+            pxrd = pxrd.astype(np.float16)  # 转换为fp16
             
             # 获取晶格和坐标
             lattice_matrix = niggli_structure.lattice.matrix.astype(np.float32)  # [3, 3]
@@ -75,7 +75,7 @@ def process_single_sample(row_data):
                 'z': z,
                 'comp': comp,
                 'atom_types': atom_types_padded,
-                'pxrd': pxrd.astype(np.float32),
+                'pxrd': pxrd,  # 已经是fp16
                 'num_atoms': num_atoms
             }
             
@@ -84,32 +84,54 @@ def process_single_sample(row_data):
             return None
 
 
-def create_memmap_arrays(output_dir, n_samples):
-    """创建内存映射数组文件"""
+def save_batch_to_npz(batch_data, output_dir, batch_start_idx):
+    """将一批数据保存为npz文件"""
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 创建各个数组的内存映射文件
-    arrays = {
-        'z': np.memmap(output_dir / 'z.npy', dtype='float32', mode='w+', shape=(n_samples, 63, 3)),
-        'comp': np.memmap(output_dir / 'comp.npy', dtype='float32', mode='w+', shape=(n_samples, 60)),
-        'atom_types': np.memmap(output_dir / 'atom_types.npy', dtype='int32', mode='w+', shape=(n_samples, 60)),
-        'pxrd': np.memmap(output_dir / 'pxrd.npy', dtype='float32', mode='w+', shape=(n_samples, 11501)),
-        'num_atoms': np.memmap(output_dir / 'num_atoms.npy', dtype='int32', mode='w+', shape=(n_samples,))
-    }
+    # 收集有效样本
+    valid_samples = [s for s in batch_data if s is not None]
+    if not valid_samples:
+        return 0
     
-    return arrays
+    # 分别收集每个数组
+    z_list = [s['z'] for s in valid_samples]
+    comp_list = [s['comp'] for s in valid_samples]
+    atom_types_list = [s['atom_types'] for s in valid_samples]
+    pxrd_list = [s['pxrd'] for s in valid_samples]
+    num_atoms_list = [s['num_atoms'] for s in valid_samples]
+    ids_list = [s['id'] for s in valid_samples]
+    
+    # 堆叠成批次数组
+    z_batch = np.stack(z_list)
+    comp_batch = np.stack(comp_list)
+    atom_types_batch = np.stack(atom_types_list)
+    pxrd_batch = np.stack(pxrd_list)  # fp16格式
+    num_atoms_batch = np.array(num_atoms_list, dtype=np.int32)
+    
+    # 保存为单个npz文件（每批一个文件）
+    batch_file = output_dir / f'batch_{batch_start_idx:06d}.npz'
+    np.savez_compressed(
+        batch_file,
+        z=z_batch,
+        comp=comp_batch,
+        atom_types=atom_types_batch,
+        pxrd=pxrd_batch,  # fp16格式，节省50%空间
+        num_atoms=num_atoms_batch,
+        ids=ids_list
+    )
+    
+    return len(valid_samples)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='生成warmup内存映射缓存')
+    parser = argparse.ArgumentParser(description='生成warmup npz缓存')
     parser.add_argument('--csv', type=str, 
-                       default='/home/ma-user/work/mincycle4csp/data/full_mp/full_mp.csv',
+                       default='/home/ma-user/work/mincycle4csp/data/merged_cdvae/test.csv',
                        help='输入CSV文件路径')
     parser.add_argument('--output_dir', type=str,
-                       default='/home/ma-user/work/mincycle4csp/data/full_mp_cache',
+                       default='/home/ma-user/work/mincycle4csp/data/test_cache',
                        help='输出目录路径')
-    parser.add_argument('--id_col', type=str, default='id',
+    parser.add_argument('--id_col', type=str, default='material_id',
                        help='ID列名')
     parser.add_argument('--cif_col', type=str, default='cif',
                        help='CIF列名')
@@ -118,10 +140,11 @@ def main():
     parser.add_argument('--workers', type=int, default=None,
                        help='并行工作进程数（默认为CPU核心数）')
     parser.add_argument('--batch_size', type=int, default=1000,
-                       help='每批处理的样本数')
+                       help='每个npz文件包含的样本数')
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # 读取数据
     print(f"读取数据: {args.csv}")
@@ -134,19 +157,22 @@ def main():
     print(f"总样本数: {total_samples}")
     
     # 准备并行处理的数据（添加索引）
-    row_data = [(idx, row[args.id_col], row[args.cif_col]) for idx, (_, row) in enumerate(df.iterrows())]
+    row_data = [(idx, row[args.id_col], row[args.cif_col]) 
+                for idx, (_, row) in enumerate(df.iterrows())]
     
     # 设置工作进程数
     n_workers = args.workers or cpu_count()
     print(f"使用 {n_workers} 个进程并行处理")
     
-    # 第一遍：并行处理所有样本，收集有效样本
-    print("\n第一步：处理样本并收集有效数据...")
-    valid_samples = []
-    ids_list = []
-    
+    # 分批处理
     batch_size = args.batch_size
     total_batches = (len(row_data) + batch_size - 1) // batch_size
+    
+    success_count = 0
+    fail_count = 0
+    all_ids = []
+    
+    print(f"\n开始处理（每批 {batch_size} 个样本，共 {total_batches} 批）...")
     
     for batch_idx in range(total_batches):
         start_idx = batch_idx * batch_size
@@ -163,85 +189,69 @@ def main():
                 desc=f"批次 {batch_idx + 1}"
             ))
         
-        # 收集有效样本
-        for item in processed_batch:
-            if item is not None:
-                valid_samples.append(item)
-                ids_list.append(item['id'])
-    
-    n_valid = len(valid_samples)
-    n_filtered = total_samples - n_valid
-    
-    print(f"\n有效样本数: {n_valid}")
-    print(f"过滤样本数（处理失败或原子数>60）: {n_filtered}")
-    
-    if n_valid == 0:
-        print("没有有效样本，退出")
-        return
-    
-    # 第二步：创建内存映射数组并写入数据
-    print(f"\n第二步：创建内存映射数组...")
-    arrays = create_memmap_arrays(output_dir, n_valid)
-    
-    print("写入数据到内存映射数组...")
-    for i, sample in enumerate(tqdm(valid_samples, desc="写入数据")):
-        arrays['z'][i] = sample['z']
-        arrays['comp'][i] = sample['comp']
-        arrays['atom_types'][i] = sample['atom_types']
-        arrays['pxrd'][i] = sample['pxrd']
-        arrays['num_atoms'][i] = sample['num_atoms']
-    
-    # 刷新到磁盘
-    print("刷新数据到磁盘...")
-    for array in arrays.values():
-        array.flush()
+        # 保存批次数据
+        n_valid = save_batch_to_npz(processed_batch, output_dir, batch_idx)
+        
+        # 统计
+        success_count += n_valid
+        fail_count += len(batch_data) - n_valid
+        
+        # 收集有效ID
+        valid_samples = [s for s in processed_batch if s is not None]
+        all_ids.extend([s['id'] for s in valid_samples])
+        
+        print(f"  批次完成：成功 {n_valid}，失败 {len(batch_data) - n_valid}")
     
     # 保存元数据
     metadata = {
-        'n_samples': n_valid,
-        'n_filtered': n_filtered,
+        'format': 'npz_batched',
+        'n_samples': success_count,
+        'n_batches': total_batches,
+        'batch_size': batch_size,
+        'n_filtered': fail_count,
         'max_atoms': 60,
         'pxrd_dim': 11501,
+        'pxrd_dtype': 'float16',  # 标记使用fp16
         'source_csv': args.csv,
-        'ids': ids_list,
-        'shapes': {
-            'z': [n_valid, 63, 3],
-            'comp': [n_valid, 60],
-            'atom_types': [n_valid, 60],
-            'pxrd': [n_valid, 11501],
-            'num_atoms': [n_valid]
-        },
-        'dtypes': {
-            'z': 'float32',
-            'comp': 'float32',
-            'atom_types': 'int32',
-            'pxrd': 'float32',
-            'num_atoms': 'int32'
+        'ids': all_ids,
+        'data_info': {
+            'z_shape': [63, 3],
+            'comp_shape': [60],
+            'atom_types_shape': [60],
+            'pxrd_shape': [11501],
+            'z_dtype': 'float32',
+            'comp_dtype': 'float32',
+            'atom_types_dtype': 'int32',
+            'pxrd_dtype': 'float16',  # fp16节省内存
+            'num_atoms_dtype': 'int32'
         }
     }
     
+    import json
     metadata_path = output_dir / 'metadata.json'
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     
+    # 计算内存占用
+    fp32_size = success_count * 11501 * 4 / (1024**3)  # 如果用fp32
+    fp16_size = success_count * 11501 * 2 / (1024**3)  # 实际用fp16
+    saved_gb = fp32_size - fp16_size
+    saved_percent = (saved_gb / fp32_size) * 100
+    
     # 输出统计信息
     print(f"\n处理完成:")
-    print(f"  有效样本数: {n_valid}")
-    print(f"  过滤样本数: {n_filtered}")
+    print(f"  成功样本数: {success_count}")
+    print(f"  失败样本数: {fail_count}")
+    print(f"  生成批次文件: {total_batches} 个")
     print(f"  数据目录: {output_dir}")
     print(f"  元数据文件: {metadata_path}")
+    print(f"\n内存优化:")
+    print(f"  PXRD使用fp16格式")
+    print(f"  理论内存占用: {fp32_size:.2f} GB (fp32)")
+    print(f"  实际内存占用: {fp16_size:.2f} GB (fp16)")
+    print(f"  节省内存: {saved_gb:.2f} GB ({saved_percent:.1f}%)")
     
-    # 验证数据
-    print(f"\n验证数据...")
-    z_test = np.memmap(output_dir / 'z.npy', dtype='float32', mode='r', shape=(n_valid, 63, 3))
-    print(f"  z数组形状: {z_test.shape}")
-    print(f"  z数组前3行（晶格）非零元素数: {np.count_nonzero(z_test[0, :3, :])}")
-    
-    pxrd_test = np.memmap(output_dir / 'pxrd.npy', dtype='float32', mode='r', shape=(n_valid, 11501))
-    print(f"  pxrd数组形状: {pxrd_test.shape}")
-    print(f"  pxrd数组第一个样本非零元素数: {np.count_nonzero(pxrd_test[0])}")
-    
-    print("\n✅ 内存映射缓存创建成功！")
+    print("\n✅ npz缓存创建成功！")
     print("\n使用方法：")
     print(f"  from src.data import CrystalDataset")
     print(f"  dataset = CrystalDataset('{output_dir}')")

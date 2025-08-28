@@ -40,21 +40,21 @@ class DataNormalizer:
         self.use_global_stats = use_global_stats
         
         # 默认统计值（基于 merged_cdvae_total.pkl 计算，全部74310样本）
-        self.default_stats = {
-            'lattice_global_mean': 0.5582,
-            'lattice_global_std': 3.3490,
-            'lattice_mean': [1.8232, 0.3099, 0.0494, -0.1238, 2.0166, -0.3753, -0.4834, 0.8804, 0.9270],
-            'lattice_std': [2.7895, 2.6121, 1.8521, 2.3274, 3.7704, 1.9673, 2.4782, 2.7006, 6.2662],
-            'frac_coords_mean': [0.4454, 0.4369, 0.4450],
-            'frac_coords_std': [0.2938, 0.2935, 0.2940]
-        }
+        # self.default_stats = {
+        #     'lattice_global_mean': 0.5582,
+        #     'lattice_global_std': 3.3490,
+        #     'lattice_mean': [1.8232, 0.3099, 0.0494, -0.1238, 2.0166, -0.3753, -0.4834, 0.8804, 0.9270],
+        #     'lattice_std': [2.7895, 2.6121, 1.8521, 2.3274, 3.7704, 1.9673, 2.4782, 2.7006, 6.2662],
+        #     'frac_coords_mean': [0.4454, 0.4369, 0.4450],
+        #     'frac_coords_std': [0.2938, 0.2935, 0.2940]
+        # }
         
         # 加载统计信息
         if stats_file and Path(stats_file).exists():
             with open(stats_file, 'r') as f:
                 self.stats = json.load(f)
         else:
-            self.stats = self.default_stats
+            raise ValueError(f"统计信息文件不存在: {stats_file}")
         
         # 转换为张量以便GPU计算
         self._prepare_tensors()

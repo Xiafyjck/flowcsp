@@ -1,47 +1,27 @@
 """
-Data loading module for crystal structure generation
-Handles both pickle format and memory-mapped numpy arrays
+数据加载模块 - 晶体结构生成
+仅支持npz格式，使用fp16存储PXRD以节省内存
 """
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-import pandas as pd
 import numpy as np
-import pickle
 import json
-from typing import Dict, Optional, Tuple, List, Union
+from typing import Dict, Optional, Tuple, List
 from pathlib import Path
+
 
 class SO3Augmentation:
     """
     SO3等变性数据增强模块
     通过对晶格参数应用随机旋转变换来增强数据
-    
-    原理：
-    - 晶格向量起点固定在原点，只能旋转不能平移
-    - 只对初始数据的晶格参数施加SO3旋转变换
-    - Flow Matching的线性插值会自动保持等变性
-    - 三种等变性通过同一种方式实现：
-      1. 晶格参数SO3变换对分数坐标的不变性：model_frac(SO3(lattice), ...) = model_frac(lattice, ...)
-      2. 晶格参数SO3变换对条件(comp,pxrd)的不变性
-      3. 晶格参数去噪网络的SO3等变性：model_lattice(SO3(lattice), ...) = SO3(model_lattice(lattice, ...))
     """
     
     def __init__(self, augment_prob: float = 0.5):
-        """
-        Args:
-            augment_prob: 应用数据增强的概率
-        """
         self.augment_prob = augment_prob
     
     def _random_rotation_matrix(self, device: torch.device) -> torch.Tensor:
-        """
-        生成随机SO(3)旋转矩阵
-        使用Rodrigues旋转公式生成均匀分布的旋转
-        
-        Returns:
-            旋转矩阵 [3, 3]
-        """
+        """生成随机SO(3)旋转矩阵"""
         # 生成随机旋转轴（单位向量）
         axis = torch.randn(3, device=device)
         axis = axis / torch.norm(axis)
@@ -50,8 +30,6 @@ class SO3Augmentation:
         angle = torch.rand(1, device=device) * 2 * torch.pi
         
         # 使用Rodrigues公式构建旋转矩阵
-        # R = I + sin(θ)K + (1-cos(θ))K²
-        # 其中K是轴向量的叉乘矩阵
         K = torch.zeros(3, 3, device=device)
         K[0, 1] = -axis[2]
         K[0, 2] = axis[1]
@@ -65,84 +43,40 @@ class SO3Augmentation:
         
         return R
     
-    
     def apply_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        对batch应用SO3增强
-        
-        重要：这个增强应用于初始数据（t=0时刻），用于训练Flow Matching模型
-        Flow Matching的线性插值会自动保持等变性
-        
-        Args:
-            batch: 包含z, comp, pxrd等的batch数据（初始数据）
-            
-        Returns:
-            增强后的batch
-        """
+        """对batch应用SO3增强"""
         batch_size = batch['z'].shape[0]
         device = batch['z'].device
         
-        # 对每个样本独立应用增强
         for i in range(batch_size):
             if torch.rand(1).item() > self.augment_prob:
-                continue  # 跳过不需要增强的样本
+                continue
             
             # 生成随机SO(3)旋转矩阵
             rotation = self._random_rotation_matrix(device)
             
-            # 提取晶格参数（前3行）
+            # 提取并旋转晶格参数（前3行）
             lattice = batch['z'][i, :3, :]  # [3, 3]
-            
-            # 应用SO(3)旋转到晶格参数
-            # lattice' = R @ lattice
-            # 注意：不能平移，晶格向量起点必须在原点
-            transformed_lattice = rotation @ lattice
-            
-            # 更新晶格参数
-            batch['z'][i, :3, :] = transformed_lattice
-            
-            # 注意：分数坐标不需要变换（它们相对于晶格保持不变）
-            # 这是因为分数坐标是相对于晶格基向量定义的
-            # 当晶格旋转时，分数坐标自动"跟随"旋转
+            batch['z'][i, :3, :] = rotation @ lattice
         
         return batch
     
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """使SO3Augmentation可以作为函数调用"""
         return self.apply_batch(batch)
 
 
 class PermutationAugmentation:
     """
     置换等变性数据增强模块
-    通过随机置换原子顺序来增强数据，保持晶体结构的物理等价性
-    
-    原理：
-    - 对于相同元素的原子，交换它们的位置不改变晶体的物理性质
-    - 使用置换矩阵P对comp和frac_coords进行相同的变换
-    - 保证模型满足：model(P(comp), ...) = P(model(comp, ...))
+    通过随机置换原子顺序来增强数据
     """
     
     def __init__(self, augment_prob: float = 0.5, max_atoms: int = 60):
-        """
-        Args:
-            augment_prob: 应用数据增强的概率
-            max_atoms: 最大原子数量
-        """
         self.augment_prob = augment_prob
         self.max_atoms = max_atoms
     
     def _group_atoms_by_type(self, comp: torch.Tensor, num_atoms: int) -> Dict[int, List[int]]:
-        """
-        按原子类型分组原子索引
-        
-        Args:
-            comp: 原子组成向量 [max_atoms]
-            num_atoms: 实际原子数量
-            
-        Returns:
-            字典，键为原子类型(Z)，值为该类型原子的索引列表
-        """
+        """按原子类型分组原子索引"""
         groups = {}
         for i in range(num_atoms):
             atom_type = int(comp[i].item())
@@ -152,44 +86,18 @@ class PermutationAugmentation:
                 groups[atom_type].append(i)
         return groups
     
-    def _create_permutation_matrix(self, n: int, perm: torch.Tensor) -> torch.Tensor:
-        """
-        创建置换矩阵
-        使用F.one_hot实现，更简洁高效
-        
-        Args:
-            n: 矩阵维度
-            perm: 置换索引向量
-            
-        Returns:
-            置换矩阵 [n, n]
-        """
-        # 使用one_hot创建置换矩阵，符合CLAUDE.md的建议
-        import torch.nn.functional as F
-        perm_matrix = F.one_hot(perm, num_classes=n).float()
-        return perm_matrix
-    
     def apply_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        对batch应用置换增强
-        
-        Args:
-            batch: 包含z, comp, pxrd等的batch数据
-            
-        Returns:
-            增强后的batch
-        """
+        """对batch应用置换增强"""
         batch_size = batch['z'].shape[0]
         device = batch['z'].device
         
-        # 对每个样本独立应用增强
         for i in range(batch_size):
             if torch.rand(1).item() > self.augment_prob:
-                continue  # 跳过不需要增强的样本
+                continue
             
             num_atoms = int(batch['num_atoms'][i].item())
             if num_atoms <= 1:
-                continue  # 单原子或无原子不需要置换
+                continue
             
             # 按原子类型分组
             atom_groups = self._group_atoms_by_type(batch['comp'][i], num_atoms)
@@ -199,15 +107,14 @@ class PermutationAugmentation:
             
             for atom_type, indices in atom_groups.items():
                 if len(indices) <= 1:
-                    continue  # 单个原子不需要置换
+                    continue
                 
                 # 对该组原子进行随机置换
                 group_indices = torch.tensor(indices, device=device)
                 shuffled = group_indices[torch.randperm(len(indices), device=device)]
                 perm[group_indices] = shuffled
             
-            # 应用置换到comp和frac_coords
-            # 注意：z的前3行是晶格参数，不参与置换
+            # 应用置换到comp和atom_types
             batch['comp'][i] = batch['comp'][i][perm]
             batch['atom_types'][i] = batch['atom_types'][i][perm]
             
@@ -218,218 +125,151 @@ class PermutationAugmentation:
         return batch
     
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """使PermutationAugmentation可以作为函数调用"""
         return self.apply_batch(batch)
 
 
 class CrystalDataset(Dataset):
     """
-    Dataset for crystal structures with PXRD patterns
-    Supports both pickle files and memory-mapped numpy arrays
+    晶体结构数据集 - 仅支持npz格式
+    使用fp16存储PXRD以节省内存
     """
     
     def __init__(
         self,
-        data_path: Union[str, Path],
+        data_path: str,
         max_atoms: int = 60,
         pxrd_dim: int = 11501,
         transform = None,
-        use_memmap: Optional[bool] = None
+        cache_in_memory: bool = True  # 默认开启内存缓存
     ):
         """
         Args:
-            data_path: Path to data (pickle file or memmap directory)
-            max_atoms: Maximum number of atoms (for padding)
-            pxrd_dim: Dimension of PXRD pattern
-            transform: Optional data transformation
-            use_memmap: Force memmap mode (True) or pickle mode (False). Auto-detect if None
+            data_path: npz缓存目录路径
+            max_atoms: 最大原子数量
+            pxrd_dim: PXRD维度
+            transform: 可选的数据变换
+            cache_in_memory: 是否将所有数据缓存到内存（默认True）
         """
         self.max_atoms = max_atoms
         self.pxrd_dim = pxrd_dim
         self.transform = transform
         self.data_path = Path(data_path)
+        self.cache_in_memory = cache_in_memory
         
-        # 自动检测数据格式
-        if use_memmap is None:
-            # 如果是目录且包含metadata.json，使用memmap模式
-            if self.data_path.is_dir() and (self.data_path / 'metadata.json').exists():
-                use_memmap = True
-            # 如果是.pkl或.pickle文件，使用pickle模式
-            elif self.data_path.suffix in ['.pkl', '.pickle']:
-                use_memmap = False
-            else:
-                raise ValueError(f"无法确定数据格式，请指定use_memmap参数: {data_path}")
+        # 验证路径
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"数据路径不存在: {data_path}")
         
-        self.use_memmap = use_memmap
-        
-        if self.use_memmap:
-            self._load_memmap_data()
-        else:
-            self._load_pickle_data()
-    
-    def _load_memmap_data(self):
-        """加载内存映射格式数据"""
-        print(f"Loading memory-mapped data from {self.data_path}...")
+        if not self.data_path.is_dir():
+            raise ValueError(f"数据路径必须是目录: {data_path}")
         
         # 加载元数据
         metadata_path = self.data_path / 'metadata.json'
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"找不到metadata.json文件。\n"
+                f"请使用 scripts/warmup_cache.py 生成数据集缓存。"
+            )
+        
         with open(metadata_path, 'r') as f:
             self.metadata = json.load(f)
         
-        n_samples = self.metadata['n_samples']
+        # 验证格式
+        if self.metadata.get('format') != 'npz_batched':
+            raise ValueError(
+                f"数据格式不正确，期望'npz_batched'，得到'{self.metadata.get('format')}'"
+            )
         
-        # 以只读模式打开内存映射数组
-        # 多个进程可以同时访问同一个只读memmap文件
-        self.z_array = np.memmap(
-            self.data_path / 'z.npy', 
-            dtype='float32', 
-            mode='r',  # 只读模式，支持多进程访问
-            shape=tuple(self.metadata['shapes']['z'])
-        )
+        self.n_samples = self.metadata['n_samples']
+        self.n_batches = self.metadata['n_batches']
+        self.batch_size = self.metadata['batch_size']
+        self.ids = self.metadata.get('ids', [str(i) for i in range(self.n_samples)])
         
-        self.comp_array = np.memmap(
-            self.data_path / 'comp.npy',
-            dtype='float32',
-            mode='r',
-            shape=tuple(self.metadata['shapes']['comp'])
-        )
+        # 获取所有批次文件
+        self.batch_files = sorted(self.data_path.glob('batch_*.npz'))
+        if len(self.batch_files) == 0:
+            raise FileNotFoundError(f"找不到批次文件 (batch_*.npz) in {self.data_path}")
         
-        self.atom_types_array = np.memmap(
-            self.data_path / 'atom_types.npy',
-            dtype='int32',
-            mode='r',
-            shape=tuple(self.metadata['shapes']['atom_types'])
-        )
+        # 创建索引映射（样本索引 -> (批次文件索引, 批次内索引)）
+        self.index_map = []
+        for batch_idx, batch_file in enumerate(self.batch_files):
+            # 获取该批次的样本数
+            with np.load(batch_file) as data:
+                batch_samples = len(data['z'])
+            for sample_idx in range(batch_samples):
+                self.index_map.append((batch_idx, sample_idx))
         
-        self.pxrd_array = np.memmap(
-            self.data_path / 'pxrd.npy',
-            dtype='float32',
-            mode='r',
-            shape=tuple(self.metadata['shapes']['pxrd'])
-        )
+        # 内存缓存
+        self.cache = {} if cache_in_memory else None
         
-        self.num_atoms_array = np.memmap(
-            self.data_path / 'num_atoms.npy',
-            dtype='int32',
-            mode='r',
-            shape=tuple(self.metadata['shapes']['num_atoms'])
-        )
+        print(f"Loading npz dataset from {self.data_path}...")
+        print(f"  Samples: {self.n_samples}")
+        print(f"  Batches: {len(self.batch_files)}")
+        print(f"  PXRD format: fp16 (memory-efficient)")
         
-        self.ids = self.metadata.get('ids', [str(i) for i in range(n_samples)])
-        self.n_samples = n_samples
-        
-        print(f"Loaded {n_samples} samples from memory-mapped arrays")
-        print(f"  Filtered samples: {self.metadata.get('n_filtered', 0)}")
-        
-    def _load_pickle_data(self):
-        """加载pickle格式数据（保持原有逻辑）"""
-        print(f"Loading pickle data from {self.data_path}...")
-        with open(self.data_path, 'rb') as f:
-            self.data = pickle.load(f)
-        
-        # Convert to list if DataFrame
-        if isinstance(self.data, pd.DataFrame):
-            self.data = self.data.to_dict('records')
-        
-        original_count = len(self.data)
-        
-        # 过滤掉原子数超过max_atoms的样品
-        filtered_data = []
-        for sample in self.data:
-            # 获取结构来检查原子数
-            structure = sample.get('niggli_structure')
-            if structure is not None:
-                num_atoms = len(structure)
-                if num_atoms <= self.max_atoms:
-                    filtered_data.append(sample)
-        
-        self.data = filtered_data
-        filtered_count = len(self.data)
-        
-        if filtered_count < original_count:
-            print(f"⚠️ 过滤了 {original_count - filtered_count} 个原子数超过 {self.max_atoms} 的样品")
-        
-        self.n_samples = filtered_count
-        print(f"Loaded {filtered_count} samples (original: {original_count})")
-        
-        # Verify first sample
-        if len(self.data) > 0:
-            sample = self.data[0]
-            print(f"Sample keys: {list(sample.keys())}")
+        # 显示内存信息
+        pxrd_dtype = self.metadata.get('pxrd_dtype', 'float16')
+        if pxrd_dtype == 'float16':
+            pxrd_size = self.n_samples * 11501 * 2 / (1024**3)
+            print(f"  PXRD memory: ~{pxrd_size:.2f} GB (fp16)")
     
     def __len__(self):
-        return self.n_samples
+        return len(self.index_map)
+    
+    def _load_batch(self, batch_idx: int) -> Dict:
+        """加载一个批次的数据"""
+        if self.cache is not None and batch_idx in self.cache:
+            return self.cache[batch_idx]
+        
+        batch_file = self.batch_files[batch_idx]
+        batch_data = np.load(batch_file)
+        
+        if self.cache is not None:
+            self.cache[batch_idx] = batch_data
+        
+        return batch_data
     
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         """
         Returns:
             Dictionary containing:
-                - z: Combined lattice and fractional coordinates [63, 3]
-                - comp: Atomic composition [60]
-                - pxrd: PXRD pattern [11501]
-                - num_atoms: Number of actual atoms (scalar)
-                - atom_types: Atomic numbers [60]
-                - id: Sample ID
+                - z: 晶格和分数坐标 [63, 3]
+                - comp: 原子组成 [60]
+                - pxrd: PXRD谱图 [11501] (从fp16转换为fp32)
+                - num_atoms: 实际原子数量
+                - atom_types: 原子类型 [60]
+                - id: 样本ID
         """
-        if self.use_memmap:
-            # 从内存映射数组读取数据
-            # 注意：切片操作会返回numpy数组的副本，不会影响原始memmap
-            z = self.z_array[idx].copy()  # [63, 3]
-            comp = self.comp_array[idx].copy()  # [60]
-            atom_types = self.atom_types_array[idx].copy()  # [60]
-            pxrd = self.pxrd_array[idx].copy()  # [11501]
-            num_atoms = int(self.num_atoms_array[idx])
-            sample_id = self.ids[idx] if idx < len(self.ids) else str(idx)
-            
-            # 转换为tensor
-            output = {
-                'z': torch.from_numpy(z),
-                'comp': torch.from_numpy(comp),
-                'pxrd': torch.from_numpy(pxrd),
-                'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
-                'atom_types': torch.from_numpy(atom_types),
-                'id': sample_id
-            }
-        else:
-            # 原有的pickle逻辑
-            sample = self.data[idx]
-            
-            # Choose structure type
-            structure = sample['niggli_structure']
-            
-            # Extract data
-            lattice_matrix = np.array(structure.lattice.matrix, dtype=np.float32)  # [3, 3]
-            frac_coords = np.array(structure.frac_coords, dtype=np.float32)  # [num_atoms, 3]
-            atom_types = np.array([site.specie.Z for site in structure], dtype=np.int32)  # [num_atoms]
-            num_atoms = len(atom_types)
-            pxrd = sample['pxrd'].astype(np.float32)  # [11501]
-            
-            # Pad fractional coordinates and atom types to max_atoms
-            padded_frac_coords = np.zeros((self.max_atoms, 3), dtype=np.float32)
-            padded_atom_types = np.zeros(self.max_atoms, dtype=np.int32)
-            
-            # 由于已经在加载时过滤，这里num_atoms一定 <= max_atoms
-            if num_atoms > 0:
-                padded_frac_coords[:num_atoms] = frac_coords
-                padded_atom_types[:num_atoms] = atom_types
-            
-            # Create composition vector (atomic numbers at each position)
-            comp = padded_atom_types.astype(np.float32)
-            
-            # Combine lattice and coordinates into single matrix z
-            z = np.concatenate([lattice_matrix, padded_frac_coords], axis=0)  # [63, 3]
-            
-            # Convert to tensors
-            output = {
-                'z': torch.from_numpy(z),
-                'comp': torch.from_numpy(comp),
-                'pxrd': torch.from_numpy(pxrd),
-                'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
-                'atom_types': torch.from_numpy(padded_atom_types),
-                'id': str(sample.get('id', idx))
-            }
+        # 获取批次索引和批次内索引
+        batch_idx, sample_idx = self.index_map[idx]
         
-        # Apply transform if provided
+        # 加载批次数据
+        batch_data = self._load_batch(batch_idx)
+        
+        # 提取样本数据
+        z = batch_data['z'][sample_idx].copy()
+        comp = batch_data['comp'][sample_idx].copy()
+        atom_types = batch_data['atom_types'][sample_idx].copy()
+        pxrd = batch_data['pxrd'][sample_idx].copy()  # fp16格式
+        num_atoms = int(batch_data['num_atoms'][sample_idx])
+        
+        # 获取ID
+        if 'ids' in batch_data:
+            sample_id = str(batch_data['ids'][sample_idx])
+        else:
+            sample_id = self.ids[idx] if idx < len(self.ids) else str(idx)
+        
+        # 转换为tensor
+        output = {
+            'z': torch.from_numpy(z),
+            'comp': torch.from_numpy(comp),
+            'pxrd': torch.from_numpy(pxrd.astype(np.float32)),  # fp16 -> fp32
+            'num_atoms': torch.tensor(num_atoms, dtype=torch.long),
+            'atom_types': torch.from_numpy(atom_types),
+            'id': sample_id
+        }
+        
+        # 应用可选的变换
         if self.transform:
             output = self.transform(output)
         
@@ -442,17 +282,17 @@ def collate_crystal_batch(
     so3_aug: Optional[SO3Augmentation] = None
 ):
     """
-    Custom collate function with optional augmentations
+    自定义批处理函数，包含数据增强
     
     Args:
-        batch: List of dictionaries from dataset
-        permutation_aug: Optional PermutationAugmentation for atom permutation
-        so3_aug: Optional SO3Augmentation for lattice rotation
+        batch: 数据集返回的字典列表
+        permutation_aug: 可选的置换增强
+        so3_aug: 可选的SO3旋转增强
     
     Returns:
-        Collated and optionally augmented batch dictionary
+        批处理后的字典
     """
-    # Stack all tensors
+    # Stack所有tensor
     z = torch.stack([item['z'] for item in batch])
     comp = torch.stack([item['comp'] for item in batch])
     pxrd = torch.stack([item['pxrd'] for item in batch])
@@ -490,29 +330,35 @@ def get_dataloader(
     augment_so3: bool = False,
     augment_prob: float = 0.5,
     so3_augment_prob: float = 0.5,
+    cache_in_memory: bool = False,
     **dataset_kwargs
 ) -> DataLoader:
     """
-    Create dataloader with optional augmentations
+    创建数据加载器
     
     Args:
-        data_path: Path to pickle file
-        batch_size: Batch size
-        shuffle: Whether to shuffle data
-        num_workers: Number of data loading workers
-        pin_memory: Whether to pin memory for GPU transfer
-        augment_permutation: Whether to apply permutation augmentation
-        augment_so3: Whether to apply SO3 augmentation
-        augment_prob: Probability of applying permutation augmentation
-        so3_augment_prob: Probability of applying SO3 augmentation
-        **dataset_kwargs: Additional arguments for CrystalDataset
+        data_path: npz数据集路径
+        batch_size: 批次大小
+        shuffle: 是否打乱数据
+        num_workers: 数据加载进程数
+        pin_memory: 是否固定内存（GPU训练时使用）
+        augment_permutation: 是否应用置换增强
+        augment_so3: 是否应用SO3旋转增强
+        augment_prob: 置换增强概率
+        so3_augment_prob: SO3增强概率
+        cache_in_memory: 是否将数据缓存到内存
+        **dataset_kwargs: 传递给CrystalDataset的额外参数
     
     Returns:
-        DataLoader instance with optional augmentations
+        DataLoader实例
     """
-    dataset = CrystalDataset(data_path, **dataset_kwargs)
+    dataset = CrystalDataset(
+        data_path, 
+        cache_in_memory=cache_in_memory,
+        **dataset_kwargs
+    )
     
-    # 创建数据增强实例（如果需要）
+    # 创建数据增强实例
     permutation_aug = PermutationAugmentation(augment_prob=augment_prob) if augment_permutation else None
     so3_aug = SO3Augmentation(augment_prob=so3_augment_prob) if augment_so3 else None
     
@@ -544,13 +390,13 @@ def split_dataset(
     seed: int = 42
 ) -> Tuple[Dataset, Dataset, Dataset]:
     """
-    Split dataset into train/val/test
+    将数据集分割为训练/验证/测试集
     
     Args:
-        dataset: CrystalDataset instance
-        train_ratio: Ratio for training set
-        val_ratio: Ratio for validation set
-        seed: Random seed for splitting
+        dataset: CrystalDataset实例
+        train_ratio: 训练集比例
+        val_ratio: 验证集比例
+        seed: 随机种子
     
     Returns:
         train_dataset, val_dataset, test_dataset

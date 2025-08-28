@@ -18,6 +18,7 @@ class CFMFlowCFG(BaseFlow):
     核心思想：
     - 训练时以一定概率将条件置零，让模型同时学习条件和无条件分布
     - 推理时通过加权组合增强条件控制：v = v_uncond + w*(v_cond - v_uncond)
+    - 分数坐标损失计算考虑周期性边界条件
     """
     
     def __init__(self, network: nn.Module, config: dict):
@@ -50,11 +51,69 @@ class CFMFlowCFG(BaseFlow):
         
         # 归一化器
         from src.normalizer import DataNormalizer
+        stats_file = config.get('stats_file', None)
+        if stats_file is None:
+            raise ValueError("必须提供stats_file参数用于归一化")
+        
         self.normalizer = DataNormalizer(
+            stats_file=stats_file,
             normalize_lattice=config.get('normalize_lattice', True),
             normalize_frac_coords=config.get('normalize_frac_coords', False),
             use_global_stats=config.get('use_global_stats', True)
         )
+    
+    # CDVAE 风格的晶格镜像偏移列表（3×3×3 = 27个镜像）
+    OFFSET_LIST = torch.tensor([
+        [-1, -1, -1], [-1, -1, 0], [-1, -1, 1],
+        [-1, 0, -1],  [-1, 0, 0],  [-1, 0, 1],
+        [-1, 1, -1],  [-1, 1, 0],  [-1, 1, 1],
+        [0, -1, -1],  [0, -1, 0],  [0, -1, 1],
+        [0, 0, -1],   [0, 0, 0],   [0, 0, 1],
+        [0, 1, -1],   [0, 1, 0],   [0, 1, 1],
+        [1, -1, -1],  [1, -1, 0],  [1, -1, 1],
+        [1, 0, -1],   [1, 0, 0],   [1, 0, 1],
+        [1, 1, -1],   [1, 1, 0],   [1, 1, 1],
+    ], dtype=torch.float32)
+    
+    @staticmethod
+    def periodic_distance_cdvae(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        使用CDVAE风格的晶格镜像方法计算周期性距离
+        考虑27个可能的镜像位置，找到最短距离
+        
+        Args:
+            x, y: 分数坐标张量 [batch_size, num_atoms, 3]
+            
+        Returns:
+            最短周期性距离的平方 [batch_size, num_atoms, 3]
+        """
+        device = x.device
+        batch_size, num_atoms, _ = x.shape
+        
+        # 将偏移列表移到正确的设备
+        offsets = CFMFlowCFG.OFFSET_LIST.to(device)  # [27, 3]
+        num_images = offsets.shape[0]
+        
+        # 扩展维度以便批处理
+        # x: [batch_size, num_atoms, 1, 3]
+        # y: [batch_size, num_atoms, 1, 3]
+        # offsets: [1, 1, 27, 3]
+        x_expanded = x.unsqueeze(2)  # [batch_size, num_atoms, 1, 3]
+        y_expanded = y.unsqueeze(2)  # [batch_size, num_atoms, 1, 3]
+        offsets_expanded = offsets.view(1, 1, num_images, 3)
+        
+        # 计算所有镜像位置
+        y_images = y_expanded + offsets_expanded  # [batch_size, num_atoms, 27, 3]
+        
+        # 计算到所有镜像的距离
+        diffs = x_expanded - y_images  # [batch_size, num_atoms, 27, 3]
+        distances_sq = diffs ** 2  # [batch_size, num_atoms, 27, 3]
+        
+        # 对每个坐标维度，找到最小距离
+        min_distances_sq, _ = distances_sq.min(dim=2)  # [batch_size, num_atoms, 3]
+        
+        return min_distances_sq
+    
     
     def compute_loss(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
@@ -143,10 +202,28 @@ class CFMFlowCFG(BaseFlow):
             lattice_loss = F.mse_loss(lattice_pred, lattice_target)
             lattice_loss = torch.clamp(lattice_loss, max=10.0)
         
-        # 计算坐标损失
-        coords_diff = (v_pred[:, 3:] - v_target[:, 3:]) * mask[:, 3:]
-        coords_sq_error = (coords_diff ** 2).sum(dim=-1)
-        valid_atoms = mask[:, 3:, 0].sum(dim=1)
+        # 计算坐标损失（考虑周期性边界条件）
+        # 注意：这里计算的是速度场的损失，而速度场v = x1 - x0
+        # 当x1和x0都是分数坐标时，它们的差值也需要考虑周期性
+        
+        # 分离出坐标部分的速度场
+        coords_v_pred = v_pred[:, 3:]  # [batch_size, 60, 3]
+        coords_v_target = v_target[:, 3:]  # [batch_size, 60, 3]
+        
+        # 对于速度场，我们需要确保预测的速度指向正确的方向
+        # 考虑周期性：如果目标速度穿过边界，预测速度也应该穿过边界
+        coords_diff = coords_v_pred - coords_v_target
+        
+        # 应用周期性修正：将差值映射到[-0.5, 0.5]范围
+        # 这确保我们总是计算最短路径的差异
+        coords_diff = coords_diff - torch.round(coords_diff)
+        
+        # 应用mask并计算损失
+        coords_diff = coords_diff * mask[:, 3:]
+        coords_sq_error = (coords_diff ** 2).sum(dim=-1)  # [batch_size, 60]
+        
+        # 计算平均损失
+        valid_atoms = mask[:, 3:, 0].sum(dim=1)  # [batch_size]
         coords_loss = (coords_sq_error.sum(dim=1) / torch.clamp(valid_atoms * 3, min=1.0)).mean()
         
         # 总损失
@@ -161,13 +238,21 @@ class CFMFlowCFG(BaseFlow):
             v_pred_norm = torch.norm(v_pred * mask, dim=-1).mean()
             v_target_norm = torch.norm(v_target * mask, dim=-1).mean()
             
+            # 计算相对误差
+            # 直接计算整体误差，不分开处理
+            v_error = v_pred - v_target
+            
+            # 对坐标部分应用周期性修正
+            v_error[:, 3:] = v_error[:, 3:] - torch.round(v_error[:, 3:])
+            
+            # 计算误差范数
+            v_error_norm = torch.norm(v_error * mask, dim=-1)
             v_target_norm_masked = torch.norm(v_target * mask, dim=-1)
+            
             valid_mask = v_target_norm_masked > 1e-4
+            
             if valid_mask.any():
-                relative_error = torch.norm((v_pred - v_target) * mask, dim=-1)[valid_mask] / (
-                    v_target_norm_masked[valid_mask] + 1e-4
-                )
-                relative_error = relative_error.mean()
+                relative_error = (v_error_norm[valid_mask] / (v_target_norm_masked[valid_mask] + 1e-4)).mean()
             else:
                 relative_error = torch.tensor(0.0, device=device)
         
@@ -265,7 +350,8 @@ class CFMFlowCFG(BaseFlow):
         # 反归一化到物理空间
         x = self.normalizer.denormalize_z(x)
         
-        # 后处理：确保分数坐标在[0, 1]范围
+        # 后处理：确保分数坐标在[0, 1]范围（应用周期性边界条件）
+        # 使用模运算将任何超出[0,1]的坐标映射回正确范围
         x[:, 3:] = x[:, 3:] % 1.0
         
         if return_trajectory:

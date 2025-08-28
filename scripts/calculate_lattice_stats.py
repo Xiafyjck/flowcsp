@@ -41,11 +41,11 @@ def compute_lattice_stats_incremental(cache_dirs: List[Path],
                                      batch_size: int = 1000) -> Dict:
     """
     增量计算晶格参数的统计信息
-    使用Welford算法在线计算均值和方差，避免内存溢出
+    支持新的npz批量格式
     
     Args:
         cache_dirs: cache目录列表
-        batch_size: 每批处理的样本数
+        batch_size: 每批处理的样本数（未使用，保留接口兼容性）
         
     Returns:
         包含统计信息的字典
@@ -69,58 +69,97 @@ def compute_lattice_stats_incremental(cache_dirs: List[Path],
         # 加载元数据
         metadata = load_cache_metadata(cache_dir)
         n_samples = metadata['n_samples']
+        format_type = metadata.get('format', 'unknown')
         
         print(f"  样本数: {n_samples}")
+        print(f"  格式: {format_type}")
         
-        # 打开内存映射数组（只读模式）
-        z_shape = tuple(metadata['shapes']['z'])
-        z_array = np.memmap(
-            cache_dir / 'z.npy',
-            dtype='float32',
-            mode='r',
-            shape=z_shape
-        )
-        
-        num_atoms_shape = tuple(metadata['shapes']['num_atoms'])
-        num_atoms_array = np.memmap(
-            cache_dir / 'num_atoms.npy',
-            dtype='int32',
-            mode='r',
-            shape=num_atoms_shape
-        )
-        
-        # 分批处理数据
-        n_batches = (n_samples + batch_size - 1) // batch_size
-        
-        for batch_idx in tqdm(range(n_batches), desc="  计算统计"):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, n_samples)
+        if format_type == 'npz_batched':
+            # 新的npz批量格式
+            batch_files = sorted(cache_dir.glob('batch_*.npz'))
+            print(f"  批次文件数: {len(batch_files)}")
             
-            # 读取当前批次的数据
-            z_batch = z_array[start_idx:end_idx]  # [batch_size, 63, 3]
-            num_atoms_batch = num_atoms_array[start_idx:end_idx]  # [batch_size]
-            
-            # 提取晶格参数（前3行）
-            lattice_batch = z_batch[:, :3, :]  # [batch_size, 3, 3]
-            lattice_flat = lattice_batch.reshape(-1, 9)  # [batch_size, 9]
-            
-            # 更新晶格参数统计
-            batch_count = len(lattice_flat)
-            lattice_sum += np.sum(lattice_flat, axis=0)
-            lattice_sum_sq += np.sum(lattice_flat ** 2, axis=0)
-            n_total += batch_count
-            
-            # 提取分数坐标并计算统计（只统计有效原子）
-            for i in range(len(z_batch)):
-                n_atoms = num_atoms_batch[i]
-                if n_atoms > 0:
-                    # 获取该样本的有效分数坐标
-                    frac_coords = z_batch[i, 3:3+n_atoms, :]  # [n_atoms, 3]
+            for batch_file in tqdm(batch_files, desc="  处理批次文件"):
+                # 加载npz文件
+                with np.load(batch_file) as data:
+                    z_batch = data['z']  # [batch_size, 63, 3]
+                    num_atoms_batch = data['num_atoms']  # [batch_size]
                     
-                    # 更新分数坐标统计
-                    frac_sum += np.sum(frac_coords, axis=0)
-                    frac_sum_sq += np.sum(frac_coords ** 2, axis=0)
-                    frac_count += n_atoms
+                    # 提取晶格参数（前3行）
+                    lattice_batch = z_batch[:, :3, :]  # [batch_size, 3, 3]
+                    lattice_flat = lattice_batch.reshape(-1, 9)  # [batch_size, 9]
+                    
+                    # 更新晶格参数统计
+                    batch_count = len(lattice_flat)
+                    lattice_sum += np.sum(lattice_flat, axis=0)
+                    lattice_sum_sq += np.sum(lattice_flat ** 2, axis=0)
+                    n_total += batch_count
+                    
+                    # 提取分数坐标并计算统计（只统计有效原子）
+                    for i in range(len(z_batch)):
+                        n_atoms = num_atoms_batch[i]
+                        if n_atoms > 0:
+                            # 获取该样本的有效分数坐标
+                            frac_coords = z_batch[i, 3:3+n_atoms, :]  # [n_atoms, 3]
+                            
+                            # 更新分数坐标统计
+                            frac_sum += np.sum(frac_coords, axis=0)
+                            frac_sum_sq += np.sum(frac_coords ** 2, axis=0)
+                            frac_count += n_atoms
+        else:
+            # 旧的内存映射格式（向后兼容）
+            print("  警告：使用旧的内存映射格式，建议重新生成缓存")
+            
+            # 检查是否存在shapes键（旧格式）
+            if 'shapes' in metadata:
+                z_shape = tuple(metadata['shapes']['z'])
+                z_array = np.memmap(
+                    cache_dir / 'z.npy',
+                    dtype='float32',
+                    mode='r',
+                    shape=z_shape
+                )
+                
+                num_atoms_shape = tuple(metadata['shapes']['num_atoms'])
+                num_atoms_array = np.memmap(
+                    cache_dir / 'num_atoms.npy',
+                    dtype='int32',
+                    mode='r',
+                    shape=num_atoms_shape
+                )
+                
+                # 分批处理数据
+                n_batches = (n_samples + batch_size - 1) // batch_size
+                
+                for batch_idx in tqdm(range(n_batches), desc="  计算统计"):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, n_samples)
+                    
+                    # 读取当前批次的数据
+                    z_batch = z_array[start_idx:end_idx]  # [batch_size, 63, 3]
+                    num_atoms_batch = num_atoms_array[start_idx:end_idx]  # [batch_size]
+                    
+                    # 提取晶格参数（前3行）
+                    lattice_batch = z_batch[:, :3, :]  # [batch_size, 3, 3]
+                    lattice_flat = lattice_batch.reshape(-1, 9)  # [batch_size, 9]
+                    
+                    # 更新晶格参数统计
+                    batch_count = len(lattice_flat)
+                    lattice_sum += np.sum(lattice_flat, axis=0)
+                    lattice_sum_sq += np.sum(lattice_flat ** 2, axis=0)
+                    n_total += batch_count
+                    
+                    # 提取分数坐标并计算统计（只统计有效原子）
+                    for i in range(len(z_batch)):
+                        n_atoms = num_atoms_batch[i]
+                        if n_atoms > 0:
+                            # 获取该样本的有效分数坐标
+                            frac_coords = z_batch[i, 3:3+n_atoms, :]  # [n_atoms, 3]
+                            
+                            # 更新分数坐标统计
+                            frac_sum += np.sum(frac_coords, axis=0)
+                            frac_sum_sq += np.sum(frac_coords ** 2, axis=0)
+                            frac_count += n_atoms
     
     print(f"\n计算最终统计信息...")
     

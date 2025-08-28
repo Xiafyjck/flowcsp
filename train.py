@@ -29,11 +29,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Crystal Structure Generation Model')
     
     # 基本参数
-    parser.add_argument('--network', type=str, default='transformer', 
-                        choices=['transformer', 'equiformer'],
+    parser.add_argument('--network', type=str, default='crystal_transformer', 
+                        choices=['transformer', 'equiformer', 'crystal_transformer'],
                         help='Network architecture to use')
-    parser.add_argument('--flow', type=str, default='cfm',
-                        choices=['cfm', 'meanflow'],
+    parser.add_argument('--flow', type=str, default='cfm_cfg',
+                        choices=['cfm_cfg', 'meanflow'],
                         help='Flow model to use')
     
     # 数据参数
@@ -48,7 +48,7 @@ def parse_args():
                         help='Path to test memmap cache directory (optional)')
     parser.add_argument('--batch_size', type=int, default=32,  # 减小batch size提高稳定性
                         help='Batch size per GPU')
-    parser.add_argument('--num_workers', type=int, default=16,  # 增加到8个，充分利用多核CPU
+    parser.add_argument('--num_workers', type=int, default=8,  # 增加到8个，充分利用多核CPU
                         help='Number of data loading workers')
     parser.add_argument('--no_augment_permutation', action='store_true',
                         help='Disable permutation data augmentation for atoms')
@@ -62,7 +62,7 @@ def parse_args():
     # 网络参数
     parser.add_argument('--hidden_dim', type=int, default=512,  # 减小模型规模防止过拟合
                         help='Hidden dimension for transformer')
-    parser.add_argument('--num_layers', type=int, default=10,  # 减少层数
+    parser.add_argument('--num_layers', type=int, default=8,  # 减少层数
                         help='Number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=8,
                         help='Number of attention heads')
@@ -80,6 +80,8 @@ def parse_args():
                         help='Loss weight for fractional coordinates')
     parser.add_argument('--default_num_steps', type=int, default=50,
                         help='Default number of sampling steps')
+    parser.add_argument('--stats_file', type=str, default='data/lattice_stats.json',
+                        help='Path to lattice statistics JSON file for normalization')
     
     # 优化器参数
     parser.add_argument('--lr', type=float, default=5e-5,  # 降低学习率
@@ -210,7 +212,7 @@ def main():
         'loss_weight_lattice': args.loss_weight_lattice,
         'loss_weight_coords': args.loss_weight_coords,
         'default_num_steps': args.default_num_steps,
-        # TODO(human): 添加归一化相关配置
+        'stats_file': args.stats_file,  # 归一化统计文件路径
     }
     
     # 准备优化器配置
@@ -263,6 +265,12 @@ def main():
     if not Path(args.val_path).exists():
         print(f"❌ Validation cache not found: {args.val_path}")
         print(f"   Please run: python scripts/warmup_cache.py --csv your_val.csv --output_dir {args.val_path}")
+        return
+    
+    # 验证统计文件存在
+    if not Path(args.stats_file).exists():
+        print(f"❌ Statistics file not found: {args.stats_file}")
+        print(f"   Please run: python scripts/calculate_lattice_stats.py --cache_dirs {args.train_path} {args.val_path} --output {args.stats_file}")
         return
     
     # 默认启用数据增强，除非明确禁用
@@ -362,7 +370,7 @@ def main():
             if num_gpus > 1:
                 print(f"🚀 Using DDP strategy with {num_gpus} GPUs")
                 trainer_kwargs['strategy'] = DDPStrategy(
-                    find_unused_parameters=True,  # 允许未使用的参数（realtime encoder可能不总是使用）
+                    find_unused_parameters=False,  
                     gradient_as_bucket_view=True,  # 优化内存使用
                 )
             else:

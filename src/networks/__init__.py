@@ -86,6 +86,11 @@ def _register_networks():
         from .equiformer import EquiformerCSPNetwork
     except ImportError:
         pass
+    
+    try:
+        from .crystal_transformer import CrystalTransformer
+    except ImportError:
+        pass
 
 
 _register_networks()
