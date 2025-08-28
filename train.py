@@ -60,9 +60,9 @@ def parse_args():
                         help='Probability of applying SO3 augmentation')
     
     # 网络参数
-    parser.add_argument('--hidden_dim', type=int, default=512,  # 减小模型规模防止过拟合
+    parser.add_argument('--hidden_dim', type=int, default=832,  # 调整为90M参数量
                         help='Hidden dimension for transformer')
-    parser.add_argument('--num_layers', type=int, default=8,  # 减少层数
+    parser.add_argument('--num_layers', type=int, default=8,  # 保持8层以平衡深度和效率
                         help='Number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=8,
                         help='Number of attention heads')
