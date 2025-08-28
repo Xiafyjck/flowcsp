@@ -74,7 +74,7 @@ def parse_args():
                         help='Minimum noise level for CFM')
     parser.add_argument('--sigma_max', type=float, default=1.0,
                         help='Maximum noise level for CFM')
-    parser.add_argument('--loss_weight_lattice', type=float, default=2.0,
+    parser.add_argument('--loss_weight_lattice', type=float, default=1.0,
                         help='Loss weight for lattice parameters')
     parser.add_argument('--loss_weight_coords', type=float, default=1.0,
                         help='Loss weight for fractional coordinates')
@@ -84,7 +84,7 @@ def parse_args():
                         help='Path to lattice statistics JSON file for normalization')
     
     # 优化器参数
-    parser.add_argument('--lr', type=float, default=5e-5,  # 降低学习率
+    parser.add_argument('--lr', type=float, default=1e-4,  # 降低学习率
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.05,  # 增加权重衰减
                         help='Weight decay')
@@ -311,7 +311,7 @@ def main():
     # Checkpoint回调
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename='epoch{epoch:03d}-val_loss{val/loss:.4f}',
+        filename='epoch={epoch:03d}-val_loss={val/loss:.4f}',
         monitor='val/loss',
         mode='min',
         save_top_k=args.save_top_k,

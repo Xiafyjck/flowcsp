@@ -387,6 +387,7 @@ def get_dataloader(
     augment_prob: float = 0.5,
     so3_augment_prob: float = 0.5,
     cache_in_memory: bool = False,
+    drop_last: bool = False,
     **dataset_kwargs
 ) -> DataLoader:
     """
@@ -403,6 +404,7 @@ def get_dataloader(
         augment_prob: 置换增强概率
         so3_augment_prob: SO3增强概率
         cache_in_memory: 是否将数据缓存到内存
+        drop_last: 是否丢弃最后一个不完整的批次
         **dataset_kwargs: 传递给CrystalDataset的额外参数
     
     Returns:
@@ -433,7 +435,8 @@ def get_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        drop_last=drop_last  # 丢弃最后一个不完整的批次（避免批次大小不一致）
     )
     
     return dataloader

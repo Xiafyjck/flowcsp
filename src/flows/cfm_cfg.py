@@ -38,8 +38,8 @@ class CFMFlowCFG(BaseFlow):
         self.sigma_min = config.get('sigma_min', 1e-4)
         self.sigma_max = config.get('sigma_max', 1.0)
         
-        # 损失权重
-        self.loss_weight_lattice = config.get('loss_weight_lattice', 2.0)
+        # 损失权重（调整为更平衡的默认值）
+        self.loss_weight_lattice = config.get('loss_weight_lattice', 1.0)  # 降低晶格权重
         self.loss_weight_coords = config.get('loss_weight_coords', 1.0)
         
         # CFG 特定参数
@@ -164,14 +164,14 @@ class CFMFlowCFG(BaseFlow):
         t = torch.rand(batch_size, 1, device=device)
         r = torch.rand(batch_size, 1, device=device)
         
-        # 采样噪声（cosine schedule）
-        alpha = torch.cos(t * torch.pi / 2)
-        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * alpha
+        # 采样噪声（改进的线性schedule，避免初期噪声过大）
+        # 使用线性插值代替cosine schedule，更稳定
+        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * (1 - t)
         
         if sigma_t.dim() == 1:
             sigma_t = sigma_t.unsqueeze(-1)
         
-        # 生成噪声
+        # 生成噪声（确保噪声强度合理）
         x0 = torch.randn_like(x1) * sigma_t.unsqueeze(-1)
         x0 = torch.nan_to_num(x0, nan=0.0, posinf=1.0, neginf=-1.0)
         
@@ -192,15 +192,16 @@ class CFMFlowCFG(BaseFlow):
             mask[i, 3:3+n] = 1.0  # 有效原子
         mask = mask.unsqueeze(-1)  # [batch_size, 63, 1]
         
-        # 计算晶格损失
+        # 计算晶格损失（改进的损失计算）
         lattice_pred = v_pred[:, :3]
         lattice_target = v_target[:, :3]
         
         if torch.isnan(lattice_pred).any() or torch.isinf(lattice_pred).any():
             lattice_loss = torch.tensor(1.0, device=device, requires_grad=True)
         else:
-            lattice_loss = F.mse_loss(lattice_pred, lattice_target)
-            lattice_loss = torch.clamp(lattice_loss, max=10.0)
+            # 使用平滑的L1损失代替MSE，对异常值更鲁棒
+            lattice_loss = F.smooth_l1_loss(lattice_pred, lattice_target, beta=1.0)
+            # 移除硬性截断，让损失自然收敛
         
         # 计算坐标损失（考虑周期性边界条件）
         # 注意：这里计算的是速度场的损失，而速度场v = x1 - x0
@@ -226,12 +227,19 @@ class CFMFlowCFG(BaseFlow):
         valid_atoms = mask[:, 3:, 0].sum(dim=1)  # [batch_size]
         coords_loss = (coords_sq_error.sum(dim=1) / torch.clamp(valid_atoms * 3, min=1.0)).mean()
         
-        # 总损失
+        # 总损失（移除人为限制，让我们看到真实的损失值）
         loss = self.loss_weight_lattice * lattice_loss + self.loss_weight_coords * coords_loss
-        loss = torch.clamp(loss, max=20.0)
         
-        if torch.isnan(loss):
-            loss = torch.tensor(5.0, device=device, requires_grad=True)
+        # 记录原始损失值用于调试
+        original_loss = loss.item() if not torch.isnan(loss) else float('inf')
+        
+        # 只在极端情况下进行截断，避免梯度爆炸
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/Inf loss detected! lattice_loss={lattice_loss.item():.4f}, coords_loss={coords_loss.item():.4f}")
+            loss = torch.tensor(10.0, device=device, requires_grad=True)
+        elif loss > 100.0:  # 提高阈值，让我们看到真实的损失
+            print(f"Warning: Very high loss={original_loss:.4f}")
+            loss = torch.clamp(loss, max=100.0)
         
         # 计算指标
         with torch.no_grad():
@@ -264,6 +272,8 @@ class CFMFlowCFG(BaseFlow):
             'v_target_norm': v_target_norm.item(),
             'relative_error': relative_error.item(),
             't_mean': t.mean().item(),
+            'sigma_mean': sigma_t.mean().item() if sigma_t.numel() > 0 else 0.0,  # 监控噪声水平
+            'original_loss': original_loss if 'original_loss' in locals() else loss.item(),  # 记录未截断的损失
         }
         
         return loss, metrics

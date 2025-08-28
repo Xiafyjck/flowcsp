@@ -471,6 +471,7 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             pin_memory=True,
             augment_permutation=False,
             augment_so3=False,
+            drop_last=True,  # 丢弃最后的不完整批次，避免批次大小不一致的警告
             **self.dataset_kwargs
         )
     
