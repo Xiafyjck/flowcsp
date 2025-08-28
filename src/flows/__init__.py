@@ -80,6 +80,11 @@ def _register_flows():
         from .cfm import CFMFlow
     except ImportError:
         pass
+    
+    try:
+        from .cfm_cfg import CFMFlowCFG
+    except ImportError:
+        pass
         
     try:
         from .meanflow import MeanFlow

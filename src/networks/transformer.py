@@ -41,7 +41,9 @@ class TimeEmbedding(nn.Module):
         self.act = nn.SiLU()
         
     def forward(self, t):
-        # t: [batch_size, 1]
+        # t: [batch_size] or [batch_size, 1]
+        if t.dim() == 1:
+            t = t.unsqueeze(1)  # 确保是 [batch_size, 1]
         half_dim = self.dim // 8
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
@@ -80,6 +82,7 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         self.comp_proj = nn.Linear(max_atoms, hidden_dim)  # Composition embedding
         
         # 目标PXRD投影（要生成的结构对应的PXRD）
+        # 路径1: MLP分支 - 全局特征提取
         self.pxrd_target_proj = nn.Sequential(
             nn.Linear(pxrd_dim, 2048),
             nn.LayerNorm(2048),
@@ -89,6 +92,67 @@ class TransformerCSPNetwork(BaseCSPNetwork):
             nn.LayerNorm(512),
             nn.ReLU(),
             nn.Linear(512, hidden_dim)
+        )
+        
+        # 路径2: CNN分支 - 局部模式提取
+        # 1D CNN for PXRD spectrum processing
+        self.pxrd_cnn = nn.Sequential(
+            # 第一层卷积：捕捉细粒度的峰形特征
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),  # 降采样到 ~5750
+            
+            # 第二层卷积：捕捉中等尺度特征
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),  # 降采样到 ~2875
+            
+            # 第三层卷积：捕捉更大尺度的模式
+            nn.Conv1d(128, 256, kernel_size=5, padding=2),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.MaxPool1d(2),  # 降采样到 ~1437
+            
+            # 第四层卷积：进一步抽象
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.MaxPool1d(2),  # 降采样到 ~718
+            
+            # 第五层卷积：高级特征提取
+            nn.Conv1d(512, 1024, kernel_size=3, padding=1),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(64),  # 固定输出长度为64
+        )
+        
+        # CNN特征投影到hidden_dim
+        self.pxrd_cnn_proj = nn.Sequential(
+            nn.Linear(1024 * 64, 2048),  # 将flattened CNN特征映射
+            nn.LayerNorm(2048),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(2048, hidden_dim)
+        )
+        
+        # 特征融合层：融合MLP和CNN两路特征
+        self.pxrd_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+        
+        # 门控机制：自适应调节两路特征的权重
+        self.pxrd_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),  # 输出2个权重
+            nn.Softmax(dim=-1)
         )
         
         # 移除了实时PXRD encoder、门控机制和PXRD质量评估器，不再支持实时PXRD
@@ -191,8 +255,33 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         t_emb = self.time_emb_t(t)  # [batch_size, hidden_dim]
         r_emb = self.time_emb_r(r)  # [batch_size, hidden_dim]
         
-        # PXRD embeddings - 仅使用目标PXRD
-        pxrd_features = self.pxrd_target_proj(pxrd)  # [batch_size, hidden_dim]
+        # PXRD embeddings - 双路径处理
+        # 路径1: MLP处理全局特征
+        pxrd_mlp_features = self.pxrd_target_proj(pxrd)  # [batch_size, hidden_dim]
+        
+        # 路径2: CNN处理局部模式
+        # 将PXRD谱重塑为CNN输入格式 [batch_size, 1, 11501]
+        pxrd_cnn_input = pxrd.unsqueeze(1)  # 添加channel维度
+        pxrd_cnn_out = self.pxrd_cnn(pxrd_cnn_input)  # [batch_size, 1024, 64]
+        
+        # Flatten CNN输出并投影
+        pxrd_cnn_flat = pxrd_cnn_out.view(batch_size, -1)  # [batch_size, 1024*64]
+        pxrd_cnn_features = self.pxrd_cnn_proj(pxrd_cnn_flat)  # [batch_size, hidden_dim]
+        
+        # 融合两路特征
+        # 方法1: 门控融合 - 自适应权重
+        pxrd_concat = torch.cat([pxrd_mlp_features, pxrd_cnn_features], dim=-1)  # [batch_size, hidden_dim*2]
+        gate_weights = self.pxrd_gate(pxrd_concat)  # [batch_size, 2]
+        
+        # 应用门控权重
+        pxrd_gated = (pxrd_mlp_features * gate_weights[:, 0:1] + 
+                     pxrd_cnn_features * gate_weights[:, 1:2])  # [batch_size, hidden_dim]
+        
+        # 方法2: 特征融合层 - 深度融合
+        pxrd_fused = self.pxrd_fusion(pxrd_concat)  # [batch_size, hidden_dim]
+        
+        # 最终PXRD特征：门控特征 + 深度融合特征
+        pxrd_features = pxrd_gated + pxrd_fused  # [batch_size, hidden_dim]
         
         # Combine all conditions
         global_cond = comp_emb + pxrd_features + t_emb + r_emb  # [batch_size, hidden_dim]
