@@ -7,14 +7,18 @@
 import argparse
 import os
 from pathlib import Path
+from datetime import datetime
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.loggers import CSVLogger
 import warnings
+import json
 
 # 导入自定义模块
 from src.trainer import CrystalGenerationModule, CrystalGenerationDataModule
+from src.ema_callback import EMACallback  # 导入EMA回调
 
 # 忽略一些无害的警告
 warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.parallel')
@@ -34,31 +38,35 @@ def parse_args():
     
     # 数据参数
     parser.add_argument('--train_path', type=str, 
-                        default='data/merged_cdvae_train.pkl',
+                        default='data/merged_full_mp_cdvae_train.pkl',
                         help='Path to training data')
     parser.add_argument('--val_path', type=str,
-                        default='data/merged_cdvae_val.pkl',
+                        default='data/merged_full_mp_cdvae_val.pkl',
                         help='Path to validation data')
     parser.add_argument('--test_path', type=str,
-                        default='data/merged_cdvae_test.pkl',
+                        default='data/A_sample.pkl',
                         help='Path to test data (optional)')
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=32,  # 减小batch size提高稳定性
                         help='Batch size per GPU')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num_workers', type=int, default=16,  # 增加到8个，充分利用多核CPU
                         help='Number of data loading workers')
-    parser.add_argument('--augment', action='store_true',
-                        help='Use data augmentation (permutation)')
-    parser.add_argument('--augment_prob', type=float, default=0.5,
-                        help='Probability of applying augmentation')
+    parser.add_argument('--no_augment_permutation', action='store_true',
+                        help='Disable permutation data augmentation for atoms')
+    parser.add_argument('--no_augment_so3', action='store_true', 
+                        help='Disable SO3 data augmentation for lattice rotation')
+    parser.add_argument('--augment_prob', type=float, default=0.8,
+                        help='Probability of applying permutation augmentation')
+    parser.add_argument('--so3_augment_prob', type=float, default=0.8,
+                        help='Probability of applying SO3 augmentation')
     
     # 网络参数
-    parser.add_argument('--hidden_dim', type=int, default=512,
+    parser.add_argument('--hidden_dim', type=int, default=512,  # 减小模型规模防止过拟合
                         help='Hidden dimension for transformer')
-    parser.add_argument('--num_layers', type=int, default=8,
+    parser.add_argument('--num_layers', type=int, default=10,  # 减少层数
                         help='Number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=8,
                         help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.1,
+    parser.add_argument('--dropout', type=float, default=0.1,  # 增加dropout防止过拟合
                         help='Dropout rate')
     
     # 流模型参数
@@ -74,20 +82,20 @@ def parse_args():
                         help='Default number of sampling steps')
     
     # 优化器参数
-    parser.add_argument('--lr', type=float, default=3e-5,
+    parser.add_argument('--lr', type=float, default=5e-5,  # 降低学习率
                         help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
+    parser.add_argument('--weight_decay', type=float, default=0.05,  # 增加权重衰减
                         help='Weight decay')
     parser.add_argument('--optimizer', type=str, default='AdamW',
                         choices=['AdamW', 'Adam'],
                         help='Optimizer type')
     
     # 调度器参数
-    parser.add_argument('--scheduler', type=str, default='CosineAnnealingWarmup',
+    parser.add_argument('--scheduler', type=str, default='ReduceLROnPlateau',  # 使用自适应调度器
                         choices=['none', 'CosineAnnealingLR', 'CosineAnnealingWarmup', 
                                  'StepLR', 'ReduceLROnPlateau'],
                         help='Learning rate scheduler type')
-    parser.add_argument('--warmup_steps', type=int, default=1000,
+    parser.add_argument('--warmup_steps', type=int, default=2000,  # 增加warmup步数
                         help='Warmup steps for CosineAnnealingWarmup')
     parser.add_argument('--max_steps', type=int, default=100000,
                         help='Max steps for CosineAnnealingWarmup')
@@ -95,23 +103,31 @@ def parse_args():
                         help='T_max for CosineAnnealingLR')
     
     # 训练参数
-    parser.add_argument('--max_epochs', type=int, default=350,
+    parser.add_argument('--max_epochs', type=int, default=500,  # 减少epoch避免过拟合
                         help='Maximum number of epochs')
-    parser.add_argument('--gradient_clip_val', type=float, default=1.0,
-                        help='Gradient clipping value')
-    parser.add_argument('--accumulate_grad_batches', type=int, default=1,
+    parser.add_argument('--gradient_clip_val', type=float, default=1.0,  # 使用标准梯度裁剪
+                        help='Gradient clipping value (reduced for stability)')
+    parser.add_argument('--accumulate_grad_batches', type=int, default=2,  # 增加梯度累积
                         help='Accumulate gradients over k batches')
-    parser.add_argument('--val_check_interval', type=float, default=1.0,
+    parser.add_argument('--val_check_interval', type=float, default=0.5,  # 更频繁地验证
                         help='How often to check validation set')
-    parser.add_argument('--log_every_n_steps', type=int, default=50,
+    parser.add_argument('--log_every_n_steps', type=int, default=20,  # 更频繁地记录
                         help='Log metrics every n steps')
     
+    # EMA参数
+    parser.add_argument('--use_ema', action='store_true', default=True,
+                        help='Use Exponential Moving Average')
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                        help='EMA decay rate (closer to 1 = more smoothing)')
+    
     # Checkpoint参数
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                        help='Directory to save checkpoints')
+    parser.add_argument('--output_dir', type=str, default='outputs',
+                        help='Base directory for all outputs')
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Experiment name (if not provided, auto-generated)')
     parser.add_argument('--save_top_k', type=int, default=3,
                         help='Save top k checkpoints')
-    parser.add_argument('--patience', type=int, default=50,
+    parser.add_argument('--patience', type=int, default=30,  # 增加耐心值
                         help='Early stopping patience')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume training from checkpoint')
@@ -119,7 +135,7 @@ def parse_args():
     # 硬件参数
     parser.add_argument('--gpus', type=int, default=-1,
                         help='Number of GPUs to use (-1 for all available)')
-    parser.add_argument('--precision', type=str, default='16-mixed',
+    parser.add_argument('--precision', type=str, default='32',
                         choices=['32', '16-mixed', 'bf16-mixed'],
                         help='Training precision')
     parser.add_argument('--deterministic', action='store_true',
@@ -145,9 +161,37 @@ def main():
     # 设置随机种子
     pl.seed_everything(args.seed, workers=True)
     
-    # 创建checkpoint目录
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # 创建实验名称（如果未指定）
+    if args.exp_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.exp_name = f"{args.network}_{args.flow}_{timestamp}"
+    else:
+        # 如果提供了实验名称，也添加时间戳避免覆盖
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.exp_name = f"{args.exp_name}_{timestamp}"
+    
+    # 创建实验输出目录
+    exp_dir = Path(args.output_dir) / args.exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 创建子目录
+    checkpoint_dir = exp_dir / "checkpoints"
+    logs_dir = exp_dir / "logs"
+    config_dir = exp_dir / "config"
+    
+    checkpoint_dir.mkdir(exist_ok=True)
+    logs_dir.mkdir(exist_ok=True)
+    config_dir.mkdir(exist_ok=True)
+    
+    # 保存配置到文件
+    config_path = config_dir / "train_config.json"
+    with open(config_path, 'w') as f:
+        json.dump(vars(args), f, indent=2, default=str)
+    
+    print(f"\n📁 Experiment directory: {exp_dir}")
+    print(f"  ├── 📦 Checkpoints: {checkpoint_dir}")
+    print(f"  ├── 📊 Logs: {logs_dir}")
+    print(f"  └── ⚙️  Config: {config_dir}")
     
     # 准备网络配置
     network_config = {
@@ -155,7 +199,7 @@ def main():
         'num_layers': args.num_layers,
         'num_heads': args.num_heads,
         'dropout': args.dropout,
-        'max_atoms': 52,
+        'max_atoms': 60,
         'pxrd_dim': 11501,
     }
     
@@ -206,23 +250,45 @@ def main():
     
     # 创建数据模块
     print(f"📁 Loading data from {args.train_path}...")
+    # 默认启用数据增强，除非明确禁用
+    augment_permutation = not args.no_augment_permutation
+    augment_so3 = not args.no_augment_so3
+    
+    print(f"  Permutation augmentation: {'Enabled' if augment_permutation else 'Disabled'}")
+    print(f"  SO3 augmentation: {'Enabled' if augment_so3 else 'Disabled'}")
+    
     data_module = CrystalGenerationDataModule(
         train_path=args.train_path,
         val_path=args.val_path,
         test_path=args.test_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        augment=args.augment,
+        augment_permutation=augment_permutation,
+        augment_so3=augment_so3,
         augment_prob=args.augment_prob,
+        so3_augment_prob=args.so3_augment_prob
+    )
+    
+    # 设置日志记录器
+    csv_logger = CSVLogger(
+        save_dir=logs_dir,
+        name="metrics",
+        version=""  # 不使用版本号子目录
     )
     
     # 设置回调
     callbacks = []
     
+    # EMA回调（如果启用）
+    if args.use_ema:
+        ema_callback = EMACallback(decay=args.ema_decay, update_every=1)
+        callbacks.append(ema_callback)
+        print(f"✨ EMA enabled with decay={args.ema_decay}")
+    
     # Checkpoint回调
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename=f'{args.network}-{args.flow}-{{epoch:03d}}-{{val_loss:.4f}}',
+        filename='epoch{epoch:03d}-val_loss{val/loss:.4f}',
         monitor='val/loss',
         mode='min',
         save_top_k=args.save_top_k,
@@ -253,6 +319,7 @@ def main():
         'val_check_interval': args.val_check_interval,
         'log_every_n_steps': args.log_every_n_steps,
         'callbacks': callbacks,
+        'logger': csv_logger,  # 添加CSV日志记录器
         'precision': args.precision,
         'deterministic': args.deterministic,
         'enable_checkpointing': True,
@@ -280,7 +347,7 @@ def main():
             if num_gpus > 1:
                 print(f"🚀 Using DDP strategy with {num_gpus} GPUs")
                 trainer_kwargs['strategy'] = DDPStrategy(
-                    find_unused_parameters=False,
+                    find_unused_parameters=True,  # 允许未使用的参数（realtime encoder可能不总是使用）
                     gradient_as_bucket_view=True,  # 优化内存使用
                 )
             else:
@@ -301,7 +368,27 @@ def main():
         print(f"🔄 Overfitting on {args.overfit_batches} batches")
     
     if args.profile:
-        trainer_kwargs['profiler'] = 'simple'
+        from pytorch_lightning.profilers import PyTorchProfiler
+        # 使用PyTorch Profiler来分析性能瓶颈
+        trainer_kwargs['profiler'] = PyTorchProfiler(
+            dirpath=logs_dir,
+            filename="profiler_report",
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1,
+                warmup=1, 
+                active=10,
+                repeat=2
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(logs_dir / "profiler")),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        print("📊 Using PyTorch profiler with CPU/CUDA tracing")
     
     # 创建Trainer
     print("\n🏋️ Creating trainer...")
@@ -317,6 +404,7 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Learning rate: {args.lr}")
     print(f"  Scheduler: {args.scheduler}")
+    print(f"  数据加载线程: {args.num_workers}")
     
     # 开始训练
     print("\n🚀 Starting training...")
@@ -332,8 +420,12 @@ def main():
         trainer.test(model, data_module)
     
     print("\n✅ Training completed!")
-    print(f"📁 Checkpoints saved to: {checkpoint_dir}")
+    print(f"📁 Experiment outputs: {exp_dir}")
+    print(f"  ├── 📦 Checkpoints: {checkpoint_dir}")
+    print(f"  ├── 📊 Logs: {logs_dir}")
+    print(f"  └── ⚙️  Config: {config_dir}")
     print(f"🏆 Best model: {checkpoint_callback.best_model_path}")
+    print(f"📈 Metrics CSV: {logs_dir}/metrics/metrics.csv")
 
 
 if __name__ == '__main__':

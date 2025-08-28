@@ -11,7 +11,7 @@ import numpy as np
 # 导入网络和流的构建函数
 from src.networks import build_network
 from src.flows import build_flow
-from src.data import get_dataloader
+from src.data import get_dataloader  
 
 
 class CrystalGenerationModule(pl.LightningModule):
@@ -98,7 +98,8 @@ class CrystalGenerationModule(pl.LightningModule):
         loss, metrics = self.flow.compute_loss(batch)
         
         # 记录指标 - 使用sync_dist=True确保DDP兼容
-        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        # 注意：on_step=True会显示当前步的损失，on_epoch=True会自动计算epoch平均
+        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         # 记录其他指标
         for key, value in metrics.items():
@@ -129,8 +130,8 @@ class CrystalGenerationModule(pl.LightningModule):
         # 计算损失和指标
         loss, metrics = self.flow.compute_loss(batch)
         
-        # 记录指标
-        self.log('val/loss', loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        # 记录指标 - 添加batch_size以确保正确的加权平均
+        self.log('val/loss', loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         for key, value in metrics.items():
             if key != 'loss':
@@ -270,13 +271,16 @@ class CrystalGenerationModule(pl.LightningModule):
             max_steps = self.scheduler_config.get('max_steps', 100000)
             
             def lr_lambda(step):
-                if step < warmup_steps:
+                # 添加除零保护
+                if warmup_steps > 0 and step < warmup_steps:
                     # Linear warmup
-                    return step / warmup_steps
+                    return max(0.01, step / warmup_steps)  # 最低1%学习率
                 else:
                     # Cosine annealing
-                    progress = (step - warmup_steps) / (max_steps - warmup_steps)
-                    return 0.5 * (1 + np.cos(np.pi * min(progress, 1.0)))
+                    if max_steps <= warmup_steps:
+                        return 1.0  # 没有退火阶段
+                    progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+                    return max(0.01, 0.5 * (1 + np.cos(np.pi * min(progress, 1.0))))  # 最低1%
             
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             return {
@@ -382,8 +386,10 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         test_path: Optional[str] = None,
         batch_size: int = 32,
         num_workers: int = 4,
-        augment: bool = False,
+        augment_permutation: bool = False,
+        augment_so3: bool = False,
         augment_prob: float = 0.5,
+        so3_augment_prob: float = 0.5,
         **dataset_kwargs
     ):
         """
@@ -395,8 +401,14 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             test_path: 测试数据路径（可选）
             batch_size: 批量大小
             num_workers: 数据加载线程数
-            augment: 是否使用数据增强
-            augment_prob: 数据增强概率
+            augment_permutation: 是否使用置换数据增强
+            augment_so3: 是否使用SO3数据增强
+            augment_prob: 置换数据增强概率
+            so3_augment_prob: SO3数据增强概率
+            compute_realtime_pxrd: 是否计算实时PXRD
+            realtime_pxrd_prob: 实时PXRD计算概率
+            realtime_pxrd_min_t: 最小时间步
+            cache_pxrd: 是否缓存PXRD
             **dataset_kwargs: 数据集的其他参数
         """
         super().__init__()
@@ -405,8 +417,10 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         self.test_path = test_path
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.augment = augment
+        self.augment_permutation = augment_permutation
+        self.augment_so3 = augment_so3
         self.augment_prob = augment_prob
+        self.so3_augment_prob = so3_augment_prob
         self.dataset_kwargs = dataset_kwargs
     
     def setup(self, stage: Optional[str] = None):
@@ -427,8 +441,10 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            augment=self.augment,
+            augment_permutation=self.augment_permutation,
+            augment_so3=self.augment_so3,
             augment_prob=self.augment_prob,
+            so3_augment_prob=self.so3_augment_prob,
             **self.dataset_kwargs
         )
     
@@ -442,7 +458,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
                 shuffle=False,
                 num_workers=self.num_workers,
                 pin_memory=True,
-                augment=False,  # 验证时不使用数据增强
+                augment_permutation=False,  # 验证时不使用数据增强
+                augment_so3=False,
                 **self.dataset_kwargs
             )
         
@@ -452,7 +469,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            augment=False,
+            augment_permutation=False,
+            augment_so3=False,
             **self.dataset_kwargs
         )
     
@@ -467,6 +485,7 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            augment=False,  # 测试时不使用数据增强
+            augment_permutation=False,  # 测试时不使用数据增强
+            augment_so3=False,
             **self.dataset_kwargs
         )

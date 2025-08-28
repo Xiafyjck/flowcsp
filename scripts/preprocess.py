@@ -15,7 +15,7 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from tqdm import tqdm
 import pickle
 import argparse
-from src.PXRDSimulator import PXRDSimulator
+from src.pxrd_simulator import PXRDSimulator
 from multiprocessing import Pool, cpu_count
 import warnings
 
@@ -34,7 +34,7 @@ def process_single_sample(row_data):
             structure = Structure.from_str(cif, fmt="cif")
             
             # 获取Niggli和primitive结构
-            primitive_structure = structure.get_primitive_structure()
+            # primitive_structure = structure.get_primitive_structure()
             niggli_structure = structure.get_reduced_structure()
             
             # 模拟PXRD
@@ -59,10 +59,10 @@ def process_single_sample(row_data):
                 'id': material_id,
                 'structure': structure,
                 'niggli_structure': niggli_structure,
-                'primitive_structure': primitive_structure,
+                # 'primitive_structure': primitive_structure,
                 'pxrd': pxrd.astype(np.float32),
                 'niggli_comp': get_comp_str(niggli_structure),
-                'primitive_comp': get_comp_str(primitive_structure),
+                # 'primitive_comp': get_comp_str(primitive_structure),
                 'atom_types': atom_types,
                 'num_atoms': num_atoms,
                 'lattice_matrix': lattice_matrix.astype(np.float32),
@@ -76,12 +76,12 @@ def process_single_sample(row_data):
 def main():
     parser = argparse.ArgumentParser(description='预处理数据集')
     parser.add_argument('--csv', type=str, 
-                       default='/home/ma-user/work/mincycle4csp/docs/data/test_v3/A_sample.csv',
+                       default='/home/ma-user/work/mincycle4csp/data/full_mp/full_mp.csv',
                        help='CSV文件路径')
     parser.add_argument('--output', type=str,
-                       default='/home/ma-user/work/mincycle4csp/A_sample.pkl',
+                       default='/home/ma-user/work/mincycle4csp/full_mp.pkl',
                        help='输出pickle文件路径')
-    parser.add_argument('--id_col', type=str, default='ID',
+    parser.add_argument('--id_col', type=str, default='extra_id',
                        help='ID列名')
     parser.add_argument('--cif_col', type=str, default='cif',
                        help='CIF列名')

@@ -68,11 +68,11 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         num_layers = config.get('num_layers', 8)
         num_heads = config.get('num_heads', 8)
         dropout = config.get('dropout', 0.1)
-        max_atoms = config.get('max_atoms', 52)
+        max_atoms = config.get('max_atoms', 60)
         pxrd_dim = config.get('pxrd_dim', 11501)
         
-        # Calculate total sequence length: 3 lattice vectors + 52 atom positions
-        self.seq_len = 3 + max_atoms  # 55
+        # Calculate total sequence length: 3 lattice vectors + 60 atom positions
+        self.seq_len = 3 + max_atoms  # 63
         self.max_atoms = max_atoms
         
         # Input projections
@@ -91,17 +91,7 @@ class TransformerCSPNetwork(BaseCSPNetwork):
             nn.Linear(512, hidden_dim)
         )
         
-        # 实时PXRD encoder（用于真实计算的PXRD，如果有）
-        self.pxrd_real_encoder = nn.Sequential(
-            nn.Linear(pxrd_dim, 2048),
-            nn.LayerNorm(2048),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(2048, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Linear(512, hidden_dim)
-        )
+        # 移除了实时PXRD encoder、门控机制和PXRD质量评估器，不再支持实时PXRD
         
         # Time embeddings for t and r
         self.time_emb_t = TimeEmbedding(hidden_dim)
@@ -160,24 +150,23 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         Forward pass
         
         Args:
-            z: [batch_size, 55, 3] - lattice (3) + frac_coords (52)
+            z: [batch_size, 63, 3] - lattice (3) + frac_coords (60)
             t: [batch_size, 1] - time step
             r: [batch_size, 1] - another time step for flow
-            conditions: dict with 'comp', 'pxrd', 'pxrd_realtime', 'num_atoms'
+            conditions: dict with 'comp', 'pxrd', 'num_atoms'
         
         Returns:
-            [batch_size, 55, 3] - predicted update/velocity
+            [batch_size, 63, 3] - predicted update/velocity
         """
         batch_size = z.shape[0]
         device = z.device
         
         # Extract conditions
-        comp = conditions['comp']  # [batch_size, 52] - 原子组成
-        pxrd_target = conditions['pxrd']  # [batch_size, 11501] - 目标PXRD谱
-        pxrd_realtime = conditions.get('pxrd_realtime', None)  # [batch_size, 11501] - 实时PXRD谱（可选）
+        comp = conditions['comp']  # [batch_size, 60] - 原子组成
+        pxrd = conditions['pxrd']  # [batch_size, 11501] - 目标PXRD谱
         num_atoms = conditions.get('num_atoms', torch.full((batch_size,), self.max_atoms, device=device))
         
-        # Project input coordinates [batch_size, 55, 3] -> [batch_size, 55, hidden_dim]
+        # Project input coordinates [batch_size, 63, 3] -> [batch_size, 63, hidden_dim]
         x = self.coord_proj(z)
         
         # 调试：检查x的形状
@@ -197,20 +186,13 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         
         # Process conditions
         comp_emb = self.comp_proj(comp)  # [batch_size, hidden_dim]
-        pxrd_target_emb = self.pxrd_target_proj(pxrd_target)  # [batch_size, hidden_dim]
         
-        # 处理PXRD特征融合
-        # 基础特征：总是使用目标PXRD
-        pxrd_features = pxrd_target_emb  # [batch_size, hidden_dim]
-        
-        # 如果有真实计算的PXRD，添加其特征
-        if pxrd_realtime is not None:
-            pxrd_sim_emb = self.pxrd_real_encoder(pxrd_realtime)  # [batch_size, hidden_dim]
-            pxrd_features = pxrd_features + pxrd_sim_emb  # 特征融合
-        
-        # Time embeddings
+        # Time embeddings - 先计算，因为门控机制需要t_emb
         t_emb = self.time_emb_t(t)  # [batch_size, hidden_dim]
         r_emb = self.time_emb_r(r)  # [batch_size, hidden_dim]
+        
+        # PXRD embeddings - 仅使用目标PXRD
+        pxrd_features = self.pxrd_target_proj(pxrd)  # [batch_size, hidden_dim]
         
         # Combine all conditions
         global_cond = comp_emb + pxrd_features + t_emb + r_emb  # [batch_size, hidden_dim]
@@ -248,7 +230,7 @@ class TransformerCSPNetwork(BaseCSPNetwork):
         # 步骤4: 应用adaptive normalization
         x = x * (1 + scale) + shift
         
-        # Project to output space [batch_size, 55, 3]
+        # Project to output space [batch_size, 63, 3]
         output = self.output_proj(x)
         
         # Zero out padded positions

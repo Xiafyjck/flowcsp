@@ -14,3 +14,9 @@ docs/
 
 # data
 data/
+
+# outputs
+outputs/
+checkpoints/
+lightning_logs/
+test/

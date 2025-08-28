@@ -69,7 +69,7 @@ class BaseFlow(nn.Module, ABC):
             temperature: Sampling temperature
             
         Returns:
-            samples: Generated samples [batch_size, 55, 3]
+            samples: Generated samples [batch_size, 63, 3]
         """
         pass
 

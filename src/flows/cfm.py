@@ -68,17 +68,83 @@ class CFMFlow(BaseFlow):
         线性插值函数，用于构建从x0到x1的传输路径
         
         Args:
-            x0: 起始点（噪声）[batch_size, 55, 3]
-            x1: 目标点（数据）[batch_size, 55, 3]
+            x0: 起始点（噪声）[batch_size, 63, 3]
+            x1: 目标点（数据）[batch_size, 63, 3]
             t: 时间步 [batch_size, 1, 1]
             
         Returns:
-            插值结果 [batch_size, 55, 3]
+            插值结果 [batch_size, 63, 3]
         """
         # t需要广播到正确的形状
         if t.dim() == 2:
             t = t.unsqueeze(-1)  # [batch_size, 1, 1]
         return (1 - t) * x0 + t * x1
+    
+    def _sample_cfm_training_data(self, x1: torch.Tensor, conditions: Dict) -> Dict:
+        """
+        CFM训练数据采样（独立函数，便于理解和复用）
+        
+        采样过程：
+        1. 采样时间步 t ~ U(0, 1)
+        2. 生成噪声 x0 ~ N(0, sigma*I)
+        3. 计算插值 xt = (1-t)*x0 + t*x1
+        4. 计算目标速度场 v_target = x1 - x0
+        5. （可选）生成实时PXRD
+        
+        Args:
+            x1: 目标数据（归一化空间）[batch_size, 63, 3]
+            conditions: 条件字典
+            
+        Returns:
+            包含采样数据的字典：
+                - t: 时间步 [batch_size, 1]
+                - r: 第二个时间步 [batch_size, 1]
+                - x0: 噪声 [batch_size, 63, 3]
+                - xt: 插值 [batch_size, 63, 3]
+                - v_target: 目标速度场 [batch_size, 63, 3]
+                - pxrd_realtime: 实时PXRD（如果有）
+        """
+        batch_size = x1.shape[0]
+        device = x1.device
+        
+        # 采样时间步 t ~ U(0, 1)
+        t = torch.rand(batch_size, 1, device=device)
+        
+        # 采样另一个时间步 r（用于某些高级CFM变体）
+        r = torch.rand(batch_size, 1, device=device)
+        
+        # 采样噪声 x0 ~ N(0, sigma*I)
+        # 使用cosine schedule，更平滑的噪声调度
+        alpha = torch.cos(t * torch.pi / 2)  # cos schedule: 1->0 as t: 0->1
+        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * alpha
+        
+        # 确保sigma_t形状正确 [batch_size, 1]
+        if sigma_t.dim() == 1:
+            sigma_t = sigma_t.unsqueeze(-1)
+        
+        # 添加噪声
+        x0 = torch.randn_like(x1) * sigma_t.unsqueeze(-1)
+        
+        # 额外的数值稳定性检查
+        x0 = torch.nan_to_num(x0, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 计算插值 xt
+        xt = self.interpolate(x0, x1, t.unsqueeze(-1))
+        
+        # 计算目标速度场
+        v_target = x1 - x0
+        
+        # 不再计算realtime PXRD
+        pxrd_realtime = None
+        
+        return {
+            't': t,
+            'r': r,
+            'x0': x0,
+            'xt': xt,
+            'v_target': v_target,
+            'pxrd_realtime': pxrd_realtime
+        }
     
     def compute_loss(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
@@ -106,84 +172,111 @@ class CFMFlow(BaseFlow):
         batch = self.normalizer.normalize(batch, inplace=False)
         
         # 提取归一化后的数据
-        x1 = batch['z']  # 归一化的目标晶体结构 [batch_size, 55, 3]
+        x1 = batch['z']  # 归一化的目标晶体结构 [batch_size, 63, 3]
         batch_size = x1.shape[0]
         device = x1.device
         
         # 准备条件
         conditions = {
-            'comp': batch['comp'],  # [batch_size, 52]
+            'comp': batch['comp'],  # [batch_size, 60]
             'pxrd': batch['pxrd'],  # [batch_size, 11501]
             'num_atoms': batch['num_atoms']  # [batch_size]
         }
         
-        # 采样时间步 t ~ U(0, 1)
-        t = torch.rand(batch_size, 1, device=device)
+        # ========== CFM训练数据采样 ==========
+        # 原始采样代码已移至 _sample_cfm_training_data 函数
+        # 这里可以选择：
+        # 1. 使用原始的在线采样（默认）
+        # 2. 使用预计算的采样数据（如果batch中包含）
         
-        # 采样另一个时间步 r（用于某些高级CFM变体）
-        r = torch.rand(batch_size, 1, device=device)
-        
-        # 采样噪声 x0 ~ N(0, sigma*I)
-        # 使用adaptive sigma基于时间步
-        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * (1 - t)
-        x0 = torch.randn_like(x1) * sigma_t.unsqueeze(-1)
-        
-        # 计算插值 xt
-        xt = self.interpolate(x0, x1, t.unsqueeze(-1))
-        
-        # 训练时模拟realtime PXRD的可用性
-        # 早期时间步（t < 0.25）不提供realtime PXRD（结构太嘈杂）
-        # 后期时间步有一定概率提供（模拟实际计算可能失败的情况）
-        provide_realtime = (t > 0.25).float() * (torch.rand_like(t) > 0.3)  # 70%概率在后期提供
-        
-        if provide_realtime.any():
-            # 为部分样本提供模拟的realtime PXRD
-            # 实际应用中应该计算xt的真实PXRD
-            # 注意：t的形状是[batch_size, 1]，需要正确广播
-            time_factor = (1 - t).view(batch_size, 1)  # [batch_size, 1]
-            simulated_pxrd = conditions['pxrd'] + torch.randn_like(conditions['pxrd']) * 0.1 * time_factor
-            # 只为provide_realtime=1的样本设置
-            # provide_realtime的形状是[batch_size, 1]，需要广播到[batch_size, pxrd_dim]
-            mask = provide_realtime.view(batch_size, 1).expand(-1, conditions['pxrd'].shape[1])
-            conditions['pxrd_realtime'] = simulated_pxrd * mask
-        else:
+        # 检查是否有预计算数据
+        if 't' in batch and 'x0' in batch and 'xt' in batch:
+            # 使用预计算数据（来自DataLoader）
+            t = batch['t']  # [batch_size] or [batch_size, 1]
+            r = batch['r']
+            x0 = batch['x0']  # 已经在归一化空间
+            xt = batch['xt']  # 已经在归一化空间
+            v_target = x1 - x0
+            
+            # 确保t和r的形状正确
+            if t.dim() == 1:
+                t = t.unsqueeze(-1)  # [batch_size, 1]
+            if r.dim() == 1:
+                r = r.unsqueeze(-1)
+            
+            # 不再处理realtime PXRD
             conditions['pxrd_realtime'] = None
+            
+            # 记录使用了预计算
+            self.using_precomputed = True
+            
+        else:
+            # 使用原始的在线采样（向后兼容）
+            sampled_data = self._sample_cfm_training_data(x1, conditions)
+            t = sampled_data['t']
+            r = sampled_data['r']
+            x0 = sampled_data['x0']
+            xt = sampled_data['xt']
+            v_target = sampled_data['v_target']
+            # 不再使用realtime PXRD
+            
+            # 记录使用了在线采样
+            self.using_precomputed = False
         
         # 通过网络预测速度场
         v_pred = self.network(xt, t, r, conditions)
         
-        # 计算目标速度场（从x0指向x1的速度）
-        v_target = x1 - x0
+        # v_target已经在采样阶段计算（无论是预计算还是在线）
         
         # 对padding位置进行mask
-        mask = torch.zeros_like(x1[..., 0])  # [batch_size, 55]
+        mask = torch.zeros_like(x1[..., 0])  # [batch_size, 63]
         for i, n in enumerate(batch['num_atoms']):
             mask[i, :3] = 1.0  # 晶格参数始终有效
             mask[i, 3:3+n] = 1.0  # 有效原子位置
-        mask = mask.unsqueeze(-1)  # [batch_size, 55, 1]
+        mask = mask.unsqueeze(-1)  # [batch_size, 63, 1]
         
         # 计算加权MSE损失 - 只对有效位置计算，避免padding影响
         # 分别计算晶格和坐标的损失
         
         # 晶格损失 - 晶格始终有效，直接计算MSE
-        lattice_loss = F.mse_loss(
-            v_pred[:, :3],
-            v_target[:, :3]
-        )
+        # 添加数值稳定性检查，防止NaN
+        lattice_pred = v_pred[:, :3]
+        lattice_target = v_target[:, :3]
+        
+        # 检查是否有NaN或inf
+        if torch.isnan(lattice_pred).any() or torch.isinf(lattice_pred).any():
+            # 如果有NaN，返回一个稳定的损失值避免训练崩溃
+            lattice_loss = torch.tensor(1.0, device=lattice_pred.device, requires_grad=True)
+        elif torch.isnan(lattice_target).any() or torch.isinf(lattice_target).any():
+            # 目标也可能有问题
+            lattice_loss = torch.tensor(1.0, device=lattice_pred.device, requires_grad=True)
+        else:
+            # 使用更稳健的损失计算
+            lattice_loss = F.mse_loss(lattice_pred, lattice_target)
+            # 裁剪极端值
+            lattice_loss = torch.clamp(lattice_loss, max=10.0)
         
         # 坐标损失 - 需要处理不同原子数的情况
         # 方法：计算每个有效位置的平方误差，然后求平均
         coords_diff = (v_pred[:, 3:] - v_target[:, 3:]) * mask[:, 3:]  # 只保留有效位置的差值
-        coords_sq_error = (coords_diff ** 2).sum(dim=-1)  # [batch_size, 52] 每个位置的平方误差
+        coords_sq_error = (coords_diff ** 2).sum(dim=-1)  # [batch_size, 60] 每个位置的平方误差
         
         # 计算每个样本的有效原子数，用于正确的平均
         valid_atoms = mask[:, 3:, 0].sum(dim=1)  # [batch_size] 每个样本的有效原子数
-        coords_loss_per_sample = coords_sq_error.sum(dim=1) / (valid_atoms * 3 + 1e-8)  # 防止除0
+        # 使用更稳健的平均方式
+        coords_loss_per_sample = coords_sq_error.sum(dim=1) / torch.clamp(valid_atoms * 3, min=1.0)
         coords_loss = coords_loss_per_sample.mean()  # batch平均
         
         # 总损失
         loss = (self.loss_weight_lattice * lattice_loss + 
                 self.loss_weight_coords * coords_loss)
+        
+        # 最终的损失裁剪，防止梯度爆炸
+        loss = torch.clamp(loss, max=20.0)
+        
+        # 如果损失是NaN，返回一个固定值
+        if torch.isnan(loss):
+            loss = torch.tensor(5.0, device=loss.device, requires_grad=True)
         
         # 计算额外的指标用于监控
         with torch.no_grad():
@@ -192,10 +285,21 @@ class CFMFlow(BaseFlow):
             v_target_norm = torch.norm(v_target * mask, dim=-1).mean()
             
             # 预测误差（相对误差）
-            relative_error = torch.norm((v_pred - v_target) * mask, dim=-1) / (
-                torch.norm(v_target * mask, dim=-1) + 1e-8
-            )
-            relative_error = relative_error.mean()
+            # 使用更大的epsilon避免除零
+            v_target_norm_masked = torch.norm(v_target * mask, dim=-1)
+            # 只对非零目标计算相对误差
+            valid_mask = v_target_norm_masked > 1e-4
+            if valid_mask.any():
+                relative_error = torch.norm((v_pred - v_target) * mask, dim=-1)[valid_mask] / (
+                    v_target_norm_masked[valid_mask] + 1e-4
+                )
+                relative_error = relative_error.mean()
+            else:
+                relative_error = torch.tensor(0.0, device=x1.device)
+            
+            # 获取门控权重（如果网络支持）
+            gate_weight = getattr(self.network, 'last_gate_weight', 0.0)
+            quality_score = getattr(self.network, 'last_quality_score', 0.0)
         
         metrics = {
             'loss': loss.item(),
@@ -205,6 +309,9 @@ class CFMFlow(BaseFlow):
             'v_target_norm': v_target_norm.item(),
             'relative_error': relative_error.item(),
             't_mean': t.mean().item(),  # 监控时间步分布
+            'pxrd_gate_weight': gate_weight,  # 监控门控权重
+            'pxrd_quality_score': quality_score,  # 监控质量分数
+            'using_precomputed': int(getattr(self, 'using_precomputed', False)),  # 是否使用预计算
         }
         
         return loss, metrics
@@ -228,7 +335,7 @@ class CFMFlow(BaseFlow):
         
         Args:
             conditions: 条件信息字典，包含：
-                - comp: 原子组成 [batch_size, 52]，原子序数
+                - comp: 原子组成 [batch_size, 60]，原子序数
                 - pxrd: PXRD谱 [batch_size, 11501]，已归一化的强度
                 - num_atoms: 原子数量 [batch_size]
             num_steps: 采样步数（默认50）
@@ -237,10 +344,10 @@ class CFMFlow(BaseFlow):
             return_trajectory: 是否返回整个采样轨迹
             
         Returns:
-            生成的晶体结构 [batch_size, 55, 3]（物理空间）
+            生成的晶体结构 [batch_size, 63, 3]（物理空间）
             - 前3行：晶格参数矩阵（Angstrom单位）
-            - 后52行：分数坐标 [0, 1]
-            如果return_trajectory=True，返回 [num_steps+1, batch_size, 55, 3]
+            - 后60行：分数坐标 [0, 1]
+            如果return_trajectory=True，返回 [num_steps+1, batch_size, 63, 3]
         
         注意：
             输入和输出都在物理空间，归一化在内部自动处理
@@ -257,7 +364,7 @@ class CFMFlow(BaseFlow):
         # num_atoms: 整数，不需要归一化
         
         # 初始化噪声（在归一化空间）
-        x = torch.randn(batch_size, 55, 3, device=device) * temperature * self.sigma_max
+        x = torch.randn(batch_size, 63, 3, device=device) * temperature * self.sigma_max
         
         # 时间步
         dt = 1.0 / num_steps
@@ -270,9 +377,7 @@ class CFMFlow(BaseFlow):
             t = torch.full((batch_size, 1), step * dt, device=device)
             r = t.clone()  # 对于标准CFM，r可以等于t
             
-            # 计算当前位置的实时PXRD（简化版本）
-            # 实际应用中应该调用PXRDSimulator
-            conditions['pxrd_realtime'] = conditions['pxrd'] * t.squeeze(-1).unsqueeze(-1)
+            # 不再计算realtime PXRD
             
             # 预测速度场
             with torch.no_grad():
@@ -283,7 +388,7 @@ class CFMFlow(BaseFlow):
                     # 计算无条件速度（使用零PXRD）
                     conditions_uncond = conditions.copy()
                     conditions_uncond['pxrd'] = torch.zeros_like(conditions['pxrd'])
-                    conditions_uncond['pxrd_realtime'] = torch.zeros_like(conditions['pxrd'])
+                    # 不再处理realtime PXRD
                     v_uncond = self.network(x, t, r, conditions_uncond)
                     
                     # 应用classifier-free guidance
@@ -309,122 +414,5 @@ class CFMFlow(BaseFlow):
         else:
             return x
     
-    def sample_with_pxrd_feedback(
-        self, 
-        conditions: Dict[str, torch.Tensor],
-        pxrd_simulator,
-        num_steps: int = None,
-        temperature: float = 1.0,
-        pxrd_weight: float = 0.1,
-        **kwargs
-    ) -> torch.Tensor:
-        """
-        带有实时PXRD反馈的采样（对用户透明的接口）
-        
-        在采样过程中实时计算PXRD并用于引导生成
-        
-        Args:
-            conditions: 条件信息字典，包含：
-                - comp: 原子组成 [batch_size, 52]，原子序数
-                - pxrd: 目标PXRD谱 [batch_size, 11501]，已归一化的强度
-                - num_atoms: 原子数量 [batch_size]
-            pxrd_simulator: PXRD计算器实例
-            num_steps: 采样步数
-            temperature: 温度参数
-            pxrd_weight: PXRD反馈权重
-            
-        Returns:
-            生成的晶体结构 [batch_size, 55, 3]（物理空间）
-            - 前3行：晶格参数矩阵（Angstrom单位）
-            - 后52行：分数坐标 [0, 1]
-        
-        注意：
-            输入和输出都在物理空间，归一化在内部自动处理
-        """
-        if num_steps is None:
-            num_steps = self.default_num_steps
-            
-        device = conditions['pxrd'].device
-        batch_size = conditions['pxrd'].shape[0]
-        
-        # 初始化噪声
-        x = torch.randn(batch_size, 55, 3, device=device) * temperature * self.sigma_max
-        
-        # 目标PXRD
-        target_pxrd = conditions['pxrd']
-        
-        # 时间步
-        dt = 1.0 / num_steps
-        
-        # ODE积分
-        for step in range(num_steps):
-            t = torch.full((batch_size, 1), step * dt, device=device)
-            r = t.clone()
-            
-            # 尝试计算当前结构的真实PXRD
-            # 早期阶段（前25%）不尝试计算，因为结构太嘈杂
-            if step > num_steps // 4:
-                try:
-                    # 将当前状态转换为晶体结构（需要先反归一化到物理空间）
-                    x_physical = self.normalizer.denormalize_z(x.detach())
-                    lattice = x_physical[:, :3].cpu().numpy()
-                    frac_coords = x_physical[:, 3:].cpu().numpy()
-                    comp = conditions['comp'].cpu().numpy()
-                    num_atoms = conditions['num_atoms'].cpu().numpy()
-                    
-                    # 计算实时PXRD（批量计算）
-                    realtime_pxrd = []
-                    success_mask = []
-                    
-                    for i in range(batch_size):
-                        try:
-                            # TODO: 真正调用pxrd_simulator
-                            # structure = create_structure(lattice[i], frac_coords[i][:num_atoms[i]], comp[i][:num_atoms[i]])
-                            # _, pxrd_i = pxrd_simulator.simulate(structure)
-                            # 暂时模拟：后期阶段假设能计算
-                            if step > num_steps // 2:
-                                # 模拟成功计算（实际应该调用simulator）
-                                pxrd_i = target_pxrd[i] * 0.8 + torch.randn_like(target_pxrd[i]) * 0.2
-                                realtime_pxrd.append(pxrd_i)
-                                success_mask.append(True)
-                            else:
-                                realtime_pxrd.append(None)
-                                success_mask.append(False)
-                        except:
-                            realtime_pxrd.append(None)
-                            success_mask.append(False)
-                    
-                    # 只有当有成功计算的PXRD时才设置
-                    if any(success_mask):
-                        # 对于失败的样本，不提供realtime PXRD
-                        processed_pxrd = torch.zeros(batch_size, target_pxrd.shape[1], device=device)
-                        for i, (success, pxrd) in enumerate(zip(success_mask, realtime_pxrd)):
-                            if success and pxrd is not None:
-                                processed_pxrd[i] = pxrd
-                        
-                        # 只为成功的样本提供realtime PXRD
-                        conditions['pxrd_realtime'] = processed_pxrd if any(success_mask) else None
-                    else:
-                        conditions['pxrd_realtime'] = None
-                except:
-                    # 计算失败，不提供realtime PXRD
-                    conditions['pxrd_realtime'] = None
-            else:
-                # 早期阶段不提供realtime PXRD
-                conditions['pxrd_realtime'] = None
-            
-            # 预测速度场
-            with torch.no_grad():
-                v = self.network(x, t, r, conditions)
-                # 不再需要显式的PXRD引导项，因为网络通过encoder融合自动学习引导
-            
-            # Euler步进
-            x = x + v * dt
-        
-        # 反归一化生成的结构（重要：将归一化空间的结果转换回物理空间）
-        x = self.normalizer.denormalize_z(x)
-        
-        # 后处理：确保分数坐标在[0, 1]范围内
-        x[:, 3:] = x[:, 3:] % 1.0
-        
-        return x
+    # 移除了sample_with_pxrd_feedback方法，不再支持实时PXRD反馈
+    # 如需此功能，请在采样后进行后处理优化

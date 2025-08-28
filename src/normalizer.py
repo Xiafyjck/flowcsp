@@ -98,15 +98,19 @@ class DataNormalizer:
             # 归一化晶格参数（z的前3行）
             if self.use_global_stats:
                 # 全局归一化：所有晶格参数使用相同的mean/std
-                batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / self.lattice_std.to(device)
+                # 添加epsilon保护防止除零（即使在FP32下也需要）
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / safe_std
             else:
                 # 分维度归一化：每个晶格参数使用独立的mean/std
-                batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / self.lattice_std.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / safe_std
             
             # 分数坐标归一化（如果需要）
             if self.normalize_frac_coords:
                 # z的第3行之后是分数坐标
-                batch['z'][:, 3:, :] = (batch['z'][:, 3:, :] - self.frac_mean.to(device)) / self.frac_std.to(device)
+                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
+                batch['z'][:, 3:, :] = (batch['z'][:, 3:, :] - self.frac_mean.to(device)) / safe_frac_std
         
         return batch
     
@@ -132,13 +136,16 @@ class DataNormalizer:
             
             # 反归一化晶格参数
             if self.use_global_stats:
-                batch['z'][:, :3, :] = batch['z'][:, :3, :] * self.lattice_std.to(device) + self.lattice_mean.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                batch['z'][:, :3, :] = batch['z'][:, :3, :] * safe_std + self.lattice_mean.to(device)
             else:
-                batch['z'][:, :3, :] = batch['z'][:, :3, :] * self.lattice_std.to(device) + self.lattice_mean.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                batch['z'][:, :3, :] = batch['z'][:, :3, :] * safe_std + self.lattice_mean.to(device)
             
             # 反归一化分数坐标
             if self.normalize_frac_coords:
-                batch['z'][:, 3:, :] = batch['z'][:, 3:, :] * self.frac_std.to(device) + self.frac_mean.to(device)
+                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
+                batch['z'][:, 3:, :] = batch['z'][:, 3:, :] * safe_frac_std + self.frac_mean.to(device)
         
         return batch
     
@@ -147,7 +154,7 @@ class DataNormalizer:
         仅归一化z张量（便捷方法）
         
         Args:
-            z: 原始z张量 [batch, 55, 3]
+            z: 原始z张量 [batch, 63, 3]
             
         Returns:
             归一化的z张量
@@ -157,12 +164,15 @@ class DataNormalizer:
         
         if self.normalize_lattice:
             if self.use_global_stats:
-                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / self.lattice_std.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / safe_std
             else:
-                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / self.lattice_std.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / safe_std
             
             if self.normalize_frac_coords:
-                z_norm[:, 3:, :] = (z[:, 3:, :] - self.frac_mean.to(device)) / self.frac_std.to(device)
+                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
+                z_norm[:, 3:, :] = (z[:, 3:, :] - self.frac_mean.to(device)) / safe_frac_std
         
         return z_norm
     
@@ -173,7 +183,7 @@ class DataNormalizer:
         用于采样后的后处理，将归一化空间的结果转换回物理空间
         
         Args:
-            z: 归一化的z张量 [batch, 55, 3]
+            z: 归一化的z张量 [batch, 63, 3]
             
         Returns:
             反归一化的z张量（物理空间）
@@ -183,12 +193,15 @@ class DataNormalizer:
         
         if self.normalize_lattice:
             if self.use_global_stats:
-                z_denorm[:, :3, :] = z[:, :3, :] * self.lattice_std.to(device) + self.lattice_mean.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                z_denorm[:, :3, :] = z[:, :3, :] * safe_std + self.lattice_mean.to(device)
             else:
-                z_denorm[:, :3, :] = z[:, :3, :] * self.lattice_std.to(device) + self.lattice_mean.to(device)
+                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
+                z_denorm[:, :3, :] = z[:, :3, :] * safe_std + self.lattice_mean.to(device)
             
             if self.normalize_frac_coords:
-                z_denorm[:, 3:, :] = z[:, 3:, :] * self.frac_std.to(device) + self.frac_mean.to(device)
+                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
+                z_denorm[:, 3:, :] = z[:, 3:, :] * safe_frac_std + self.frac_mean.to(device)
         
         return z_denorm
     
@@ -215,19 +228,19 @@ class DataNormalizer:
         
         for i in range(num_samples):
             data = dataset[i]
-            z = data['z']  # [55, 3]
+            z = data['z']  # [63, 3]
             
             # 晶格参数（前3行）
             lattice = z[:3].flatten()  # [9]
             lattices.append(lattice)
             
             # 分数坐标（第3行之后）
-            frac_coords = z[3:]  # [52, 3]
+            frac_coords = z[3:]  # [60, 3]
             frac_coords_list.append(frac_coords.flatten())
         
         # 转换为张量
         lattices = torch.stack(lattices)  # [num_samples, 9]
-        frac_coords_tensor = torch.stack(frac_coords_list)  # [num_samples, 52*3]
+        frac_coords_tensor = torch.stack(frac_coords_list)  # [num_samples, 60*3]
         
         # 计算统计
         stats = {

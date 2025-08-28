@@ -18,7 +18,7 @@ class BaseCSPNetwork(nn.Module, ABC):
     @abstractmethod
     def forward(
         self, 
-        z: torch.Tensor,           # [batch_size, 3+52, 3] (lattice + frac_coords)
+        z: torch.Tensor,           # [batch_size, 3+60, 3] (lattice + frac_coords)
         t: torch.Tensor,           # [batch_size, 1] time step
         r: torch.Tensor,           # [batch_size, 1] another time step  
         conditions: Dict[str, torch.Tensor] # conditions including comp, pxrd, etc
@@ -27,19 +27,19 @@ class BaseCSPNetwork(nn.Module, ABC):
         Forward pass of the network - IMPORTANT: Do not modify this signature
         
         Args:
-            z: Current state [batch_size, 3+52, 3]
+            z: Current state [batch_size, 3+60, 3]
                - z[:, :3, :] are lattice vectors
                - z[:, 3:, :] are fractional coordinates
             t: Time step [batch_size, 1]
             r: Another time step for flow [batch_size, 1]
             conditions: Dictionary containing:
-                - 'comp': [batch_size, 52] atomic composition 
+                - 'comp': [batch_size, 60] atomic composition 
                 - 'pxrd': [batch_size, 11501] PXRD pattern
                 - 'pxrd_realtime': [batch_size, 11501] real-time PXRD (optional)
                 - 'num_atoms': [batch_size] number of atoms per sample
                 
         Returns:
-            Output in same shape as z: [batch_size, 3+52, 3]
+            Output in same shape as z: [batch_size, 3+60, 3]
         """
         raise NotImplementedError
     
