@@ -38,14 +38,14 @@ def parse_args():
     
     # 数据参数
     parser.add_argument('--train_path', type=str, 
-                        default='data/merged_full_mp_cdvae_train.pkl',
-                        help='Path to training data')
+                        default='data/merged_cdvae/train.csv',
+                        help='Path to training CSV data')
     parser.add_argument('--val_path', type=str,
-                        default='data/merged_full_mp_cdvae_val.pkl',
-                        help='Path to validation data')
+                        default='data/merged_cdvae/val.csv',
+                        help='Path to validation CSV data')
     parser.add_argument('--test_path', type=str,
-                        default='data/A_sample.pkl',
-                        help='Path to test data (optional)')
+                        default='data/merged_cdvae/test.csv',
+                        help='Path to test CSV data (optional)')
     parser.add_argument('--batch_size', type=int, default=32,  # 减小batch size提高稳定性
                         help='Batch size per GPU')
     parser.add_argument('--num_workers', type=int, default=16,  # 增加到8个，充分利用多核CPU
