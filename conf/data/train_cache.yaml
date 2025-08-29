@@ -1,0 +1,22 @@
+# 标准训练数据配置 - 使用缓存数据
+train_path: data/train_cache
+val_path: data/val_cache
+test_path: null
+
+# 数据加载配置
+batch_size: 32
+num_workers: 16
+pin_memory: true
+persistent_workers: true
+
+# 数据增强配置
+augmentation:
+  # 置换增强 - 原子顺序随机化
+  permutation:
+    enabled: true
+    prob: 0.8
+  
+  # SO3增强 - 晶格旋转
+  so3:
+    enabled: true
+    prob: 0.8

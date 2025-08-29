@@ -1,0 +1,20 @@
+# 小数据集配置 - 用于快速测试和过拟合验证
+train_path: data/small_cache
+val_path: data/small_cache
+test_path: null
+
+# 数据加载配置
+batch_size: 16  # 小数据集使用更小的batch
+num_workers: 4
+pin_memory: true
+persistent_workers: false
+
+# 数据增强配置 - 小数据集通常需要更强的增强
+augmentation:
+  permutation:
+    enabled: true
+    prob: 0.9
+  
+  so3:
+    enabled: true
+    prob: 0.9
