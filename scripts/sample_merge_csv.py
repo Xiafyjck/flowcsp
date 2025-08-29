@@ -76,21 +76,22 @@ def sample_merge_csvs(
         console=console
     ) as progress:
         
-        # 先统计所有文件的总行数
-        task = progress.add_task("[cyan]统计文件行数...", total=len(csv_files))
+        # 统计所有文件的实际记录数（使用pandas解析）
+        task = progress.add_task("[cyan]统计文件记录数...", total=len(csv_files))
         total_rows = 0
         file_rows = {}
         
         for csv_file in csv_files:
             try:
-                # 快速统计行数
-                with open(csv_file, 'r', encoding='utf-8') as f:
-                    rows = sum(1 for _ in f) - 1  # 减去header
+                # 使用pandas统计实际记录数（处理包含换行符的字段）
+                df_temp = pd.read_csv(csv_file, usecols=input_cols, nrows=None)
+                rows = len(df_temp)
                 file_rows[csv_file] = rows
                 total_rows += rows
                 progress.update(task, advance=1)
+                del df_temp  # 释放内存
             except Exception as e:
-                console.print(f"[yellow]警告: 无法统计 {csv_file.name}: {e}[/yellow]")
+                console.print(f"[yellow]警告: 无法读取 {csv_file.name}: {e}[/yellow]")
                 file_rows[csv_file] = 0
                 progress.update(task, advance=1)
         
@@ -98,101 +99,72 @@ def sample_merge_csvs(
             console.print("[red]错误: 所有文件都是空的[/red]")
             return
         
-        # 计算每个文件应该抽样的数量（按比例分配，确保总数精确）
+        # 基于随机生成的分配算法（避免除法计算）
         actual_total_samples = min(total_samples, total_rows)
         console.print(f"[yellow]总行数: {total_rows}, 目标抽样数: {actual_total_samples}[/yellow]")
         
-        # 智能分配算法：平衡比例公平和文件覆盖
-        file_allocations = {}
+        # 构建全局行索引映射：每一行对应哪个文件
         non_empty_files = [f for f in csv_files if file_rows.get(f, 0) > 0]
         
         if len(non_empty_files) == 0:
             console.print("[red]错误: 没有非空文件[/red]")
             return
-            
-        # 策略选择：当样本数 < 文件数时，确保每个文件至少有机会
-        if actual_total_samples < len(non_empty_files):
-            console.print(f"[yellow]样本数({actual_total_samples}) < 文件数({len(non_empty_files)})，启用均匀覆盖模式[/yellow]")
-            
-            # 均匀覆盖模式：每个文件至少1个样本，剩余按比例分配
-            base_per_file = max(1, actual_total_samples // len(non_empty_files))
-            allocated_total = 0
-            
-            for csv_file in non_empty_files:
-                file_allocations[csv_file] = min(base_per_file, file_rows[csv_file])
-                allocated_total += file_allocations[csv_file]
-            
-            # 分配剩余样本给大文件
-            remaining_samples = actual_total_samples - allocated_total
-            if remaining_samples > 0:
-                # 按文件大小排序，给大文件分配剩余样本
-                large_files = sorted(non_empty_files, key=lambda f: file_rows[f], reverse=True)
-                for i in range(min(remaining_samples, len(large_files))):
-                    csv_file = large_files[i % len(large_files)]
-                    if file_allocations[csv_file] < file_rows[csv_file]:
-                        file_allocations[csv_file] += 1
-                        
-        else:
-            console.print(f"[cyan]样本数({actual_total_samples}) >= 文件数({len(non_empty_files)})，启用比例分配模式[/cyan]")
-            
-            # 比例分配模式：严格按文件大小比例分配
-            allocated_total = 0
-            remainders = []
-            
-            for csv_file in non_empty_files:
-                exact_allocation = actual_total_samples * file_rows[csv_file] / total_rows
-                base_allocation = int(exact_allocation)
-                remainder = exact_allocation - base_allocation
-                
-                file_allocations[csv_file] = base_allocation
-                allocated_total += base_allocation
-                remainders.append((csv_file, remainder))
-            
-            # 分配剩余样本给余数最大的文件
-            remaining_samples = actual_total_samples - allocated_total
-            remainders.sort(key=lambda x: x[1], reverse=True)
-            
-            for i in range(remaining_samples):
-                if i < len(remainders):
-                    csv_file, _ = remainders[i]
-                    file_allocations[csv_file] += 1
         
-        # 设置空文件分配为0
-        for csv_file in csv_files:
-            if csv_file not in file_allocations:
-                file_allocations[csv_file] = 0
+        console.print(f"[cyan]使用随机抽样分配模式（避免除法计算）[/cyan]")
+        
+        # 构建全局行索引到文件的映射表
+        global_row_to_file = []  # 每个元素是(file, local_row_index)
+        
+        for csv_file in non_empty_files:
+            file_row_count = file_rows[csv_file]
+            for local_row in range(file_row_count):
+                global_row_to_file.append((csv_file, local_row))
+        
+        # 验证映射表大小
+        assert len(global_row_to_file) == total_rows, f"映射表大小不匹配: {len(global_row_to_file)} != {total_rows}"
+        
+        # 随机选择全局行索引
+        selected_global_indices = random.sample(range(total_rows), actual_total_samples)
+        
+        # 统计每个文件被选中的次数
+        file_allocations = {f: 0 for f in csv_files}  # 初始化所有文件为0
+        selected_rows_by_file = {f: [] for f in non_empty_files}  # 记录每个文件被选中的具体行号
+        
+        for global_idx in selected_global_indices:
+            selected_file, local_row = global_row_to_file[global_idx]
+            file_allocations[selected_file] += 1
+            selected_rows_by_file[selected_file].append(local_row)
         
         # 验证总数
         final_total = sum(file_allocations.values())
         console.print(f"[cyan]分配验证: 期望={actual_total_samples}, 实际分配={final_total}[/cyan]")
         
-        # 读取并抽样数据
+        # 读取并抽样数据（使用预先计算的行号）
         task = progress.add_task("[cyan]读取并抽样文件...", total=len(csv_files))
         
         for csv_file in csv_files:
             try:
                 progress.update(task, description=f"[cyan]处理: {csv_file.name}")
                 
-                # 使用精确分配的样本数
+                # 获取该文件被选中的行号
                 file_sample_size = file_allocations.get(csv_file, 0)
                 
                 # 读取CSV文件
-                if file_sample_size > 0:
-                    # 读取文件总行数
+                if file_sample_size > 0 and csv_file in selected_rows_by_file:
+                    selected_local_rows = selected_rows_by_file[csv_file]
                     total_file_rows = file_rows[csv_file]
                     
-                    if total_file_rows > 0:
-                        # 确保不超过文件实际行数
-                        actual_sample_size = min(file_sample_size, total_file_rows)
+                    if len(selected_local_rows) > 0:
+                        # 读取整个文件，然后根据选中的行号进行筛选
+                        # 这种方法对于包含换行符的CIF数据更可靠
+                        df = pd.read_csv(csv_file, usecols=input_cols)
                         
-                        # 随机选择要跳过的行
-                        if actual_sample_size < total_file_rows:
-                            skip_rows = sorted(random.sample(range(1, total_file_rows + 1), 
-                                                            total_file_rows - actual_sample_size))
-                            df = pd.read_csv(csv_file, usecols=input_cols, skiprows=skip_rows)
+                        # 根据选中的行索引筛选数据
+                        selected_local_rows = [idx for idx in selected_local_rows if idx < len(df)]
+                        if selected_local_rows:
+                            df = df.iloc[selected_local_rows].copy()
                         else:
-                            # 读取全部
-                            df = pd.read_csv(csv_file, usecols=input_cols)
+                            df = df.iloc[:0].copy()  # 空DataFrame
                         
                         # 重命名列
                         df = df.rename(columns=column_mapping)
@@ -207,17 +179,17 @@ def sample_merge_csvs(
                     else:
                         file_stats.append({
                             'name': csv_file.name,
-                            'total_rows': 0,
+                            'total_rows': total_file_rows,
                             'sampled_rows': 0,
-                            'status': 'empty'
+                            'status': 'no_selection'
                         })
                 else:
-                    # file_sample_size == 0
+                    # 文件未被选中或为空文件
                     file_stats.append({
                         'name': csv_file.name,
                         'total_rows': file_rows.get(csv_file, 0),
                         'sampled_rows': 0,
-                        'status': 'skipped'
+                        'status': 'skipped' if file_sample_size == 0 else 'empty'
                     })
                 
                 progress.update(task, advance=1)
@@ -226,7 +198,7 @@ def sample_merge_csvs(
                 console.print(f"[red]错误: 处理 {csv_file.name} 时出错: {e}[/red]")
                 file_stats.append({
                     'name': csv_file.name,
-                    'total_rows': 0,
+                    'total_rows': file_rows.get(csv_file, 0),
                     'sampled_rows': 0,
                     'status': f'error: {str(e)}'
                 })
@@ -274,6 +246,10 @@ def sample_merge_csvs(
         elif stat['status'] == 'skipped':
             ratio = "-"
             status_display = "[yellow]跳过[/yellow]"
+        elif stat['status'] == 'no_selection':
+            ratio = "-"
+            status_display = "[yellow]未选中[/yellow]"
+            total_original += stat['total_rows']
         else:
             ratio = "-"
             status_display = f"[red]✗[/red]"
