@@ -9,7 +9,7 @@ config:
   # 损失权重
   loss_weight_lattice: 5.0  # 降低晶格权重，避免主导损失
   loss_weight_coords: 1.0
-  invariant_loss_weight: 0.01  # 晶格等变性损失权重
+  invariant_loss_weight: 0.001  # 晶格等变性损失权重
   
   # CFG参数
   cfg_prob: 0.1  # 训练时条件dropout概率
