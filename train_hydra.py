@@ -302,6 +302,9 @@ def main(cfg: DictConfig) -> None:
     console.print(f"   约 {total_params/1e6:.1f}M 参数")
     
     # 创建数据模块（使用绝对路径）
+    # 如果使用diffcsp网络，自动启用GNN数据加载器
+    use_gnn_dataloader = (cfg.networks.name == 'diffcsp')
+    
     data_module = CrystalGenerationDataModule(
         train_path=str(Path(orig_cwd) / cfg.data.train_path),
         val_path=str(Path(orig_cwd) / cfg.data.val_path),
@@ -314,6 +317,9 @@ def main(cfg: DictConfig) -> None:
         so3_augment_prob=cfg.data.augmentation.so3.prob,
         pin_memory=cfg.data.get('pin_memory', True),
         persistent_workers=cfg.data.get('persistent_workers', True),
+        use_gnn_dataloader=use_gnn_dataloader,
+        gnn_radius=cfg.networks.config.get('cutoff', 6.0) if use_gnn_dataloader else 6.0,
+        gnn_max_neighbors=cfg.networks.config.get('max_neighbors', 50) if use_gnn_dataloader else 50,
     )
     
     # 设置回调和日志

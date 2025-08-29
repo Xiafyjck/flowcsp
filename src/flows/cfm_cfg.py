@@ -61,7 +61,7 @@ class CFMFlowCFG(BaseFlow):
         self.normalizer = DataNormalizer(
             stats_file=stats_file,
             normalize_lattice=config.get('normalize_lattice', True),
-            normalize_frac_coords=config.get('normalize_frac_coords', False),
+            normalize_frac_coords=config.get('normalize_frac_coords', True),  # 现在默认归一化分数坐标
             use_global_stats=config.get('use_global_stats', True)
         )
     
@@ -77,6 +77,73 @@ class CFMFlowCFG(BaseFlow):
         [1, 0, -1],   [1, 0, 0],   [1, 0, 1],
         [1, 1, -1],   [1, 1, 0],   [1, 1, 1],
     ], dtype=torch.float32)
+    
+    def sample_wrapped_normal(self, mean: torch.Tensor, std: float, shape: tuple, device: torch.device) -> torch.Tensor:
+        """
+        从Wrapped Normal分布采样（适用于周期性边界条件）
+        
+        Wrapped Normal是将正态分布"包裹"到[0,1]区间的分布，
+        通过将正态分布的值模1来实现周期性。
+        
+        Args:
+            mean: 均值张量（在[0,1]范围内）
+            std: 标准差（控制分布的集中程度）
+            shape: 输出形状
+            device: 设备
+            
+        Returns:
+            采样结果（在[0,1]范围内）
+        """
+        # 从正态分布采样
+        samples = torch.randn(shape, device=device) * std + mean
+        
+        # 包裹到[0,1]范围（应用周期性边界）
+        wrapped_samples = samples - torch.floor(samples)
+        
+        return wrapped_samples
+    
+    def sample_wrapped_normal_normalized(self, shape: tuple, device: torch.device) -> torch.Tensor:
+        """
+        在归一化空间中从Wrapped Normal分布采样
+        
+        考虑归一化变换：[0,1] → [(mean-std/2), (mean+std/2)]
+        需要相应地调整Wrapped Normal的参数
+        
+        Args:
+            shape: 输出形状
+            device: 设备
+            
+        Returns:
+            归一化空间中的采样结果
+        """
+        if self.normalizer.normalize_frac_coords:
+            # 获取归一化参数
+            frac_mean = self.normalizer.frac_mean.to(device)  # [3]
+            frac_std = self.normalizer.frac_std.to(device)    # [3]
+            
+            # 在原始[0,1]空间采样Wrapped Normal
+            # 使用较小的std以保持在单个周期内
+            wrapped_std = 0.15  # 经验值，可调整
+            original_samples = self.sample_wrapped_normal(
+                mean=torch.tensor(0.5, device=device),  # 中心在0.5
+                std=wrapped_std,
+                shape=shape,
+                device=device
+            )
+            
+            # 变换到归一化空间：(x - mean) / std
+            # 其中mean和std是从数据统计得出的
+            normalized_samples = (original_samples - frac_mean) / (frac_std + 1e-6)
+            
+            return normalized_samples
+        else:
+            # 如果不归一化，直接在[0,1]空间采样
+            return self.sample_wrapped_normal(
+                mean=torch.tensor(0.5, device=device),
+                std=0.15,
+                shape=shape,
+                device=device
+            )
     
     @staticmethod
     def periodic_distance_cdvae(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -116,58 +183,6 @@ class CFMFlowCFG(BaseFlow):
         min_distances_sq, _ = distances_sq.min(dim=2)  # [batch_size, num_atoms, 3]
         
         return min_distances_sq
-    
-    def compute_invariant_loss(self, lattice_pred, lattice_target, weight=0.1):
-        """
-        计算晶格等变性不变量损失：体积+边长+角度
-        
-        Args:
-            lattice_pred: 预测晶格速度场 [batch_size, 3, 3]
-            lattice_target: 目标晶格速度场 [batch_size, 3, 3] 
-            weight: 不变量损失权重，默认0.1
-            
-        Returns:
-            weighted_loss: 加权后的不变量损失
-            loss_components: 各组件损失字典，用于监控
-        """
-        device = lattice_pred.device
-        
-        # 1. 体积不变量 (行列式)
-        volume_pred = torch.det(lattice_pred)  # [batch_size]
-        volume_target = torch.det(lattice_target)
-        volume_loss = F.mse_loss(volume_pred, volume_target)
-        
-        # 2. 边长不变量 (向量模长)
-        lengths_pred = torch.norm(lattice_pred, dim=-1)  # [batch_size, 3]
-        lengths_target = torch.norm(lattice_target, dim=-1)
-        lengths_loss = F.mse_loss(lengths_pred, lengths_target)
-        
-        # 3. 角度不变量 (余弦相似度)
-        def compute_lattice_angles(lattice):
-            a, b, c = lattice[:, 0], lattice[:, 1], lattice[:, 2]  # [batch_size, 3] each
-            # 计算三个晶格向量间的夹角余弦值
-            cos_alpha = F.cosine_similarity(b, c, dim=-1)  # b与c夹角 (α)
-            cos_beta = F.cosine_similarity(a, c, dim=-1)   # a与c夹角 (β)
-            cos_gamma = F.cosine_similarity(a, b, dim=-1)  # a与b夹角 (γ)
-            return torch.stack([cos_alpha, cos_beta, cos_gamma], dim=-1)  # [batch_size, 3]
-        
-        angles_pred = compute_lattice_angles(lattice_pred)
-        angles_target = compute_lattice_angles(lattice_target)
-        angles_loss = F.mse_loss(angles_pred, angles_target)
-        
-        # 组合总不变量损失
-        total_invariant_loss = volume_loss + lengths_loss + angles_loss
-        weighted_loss = weight * total_invariant_loss
-        
-        # 返回详细指标用于调试
-        loss_components = {
-            'volume_loss': volume_loss.item(),
-            'lengths_loss': lengths_loss.item(),
-            'angles_loss': angles_loss.item(),
-            'total_invariant': total_invariant_loss.item()
-        }
-        
-        return weighted_loss, loss_components
     
     def compute_loss(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
@@ -220,13 +235,25 @@ class CFMFlowCFG(BaseFlow):
         
         # 采样噪声（改进的线性schedule，避免初期噪声过大）
         # 使用线性插值代替cosine schedule，更稳定
-        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * (1 - t)
+        sigma_t = self.sigma_min + (self.sigma_max - self.sigma_min) * (1 - t)  # [batch_size, 1]
         
-        if sigma_t.dim() == 1:
-            sigma_t = sigma_t.unsqueeze(-1)
+        # 生成噪声：晶格参数使用正态分布，分数坐标使用Wrapped Normal
+        x0 = torch.zeros_like(x1)  # [batch_size, 63, 3]
         
-        # 生成噪声（确保噪声强度合理）
-        x0 = torch.randn_like(x1) * sigma_t.unsqueeze(-1)
+        # 晶格参数：使用标准正态分布
+        x0[:, :3, :] = torch.randn(batch_size, 3, 3, device=device) * sigma_t.unsqueeze(-1)
+        
+        # 分数坐标：使用Wrapped Normal先验分布（归一化空间）
+        # 这确保了噪声也遵循周期性边界条件
+        frac_coords_noise = self.sample_wrapped_normal_normalized(
+            shape=(batch_size, 60, 3),
+            device=device
+        )
+        
+        # 应用噪声强度调制
+        x0[:, 3:, :] = frac_coords_noise * sigma_t.unsqueeze(-1)
+        
+        # 数值稳定性处理
         x0 = torch.nan_to_num(x0, nan=0.0, posinf=1.0, neginf=-1.0)
         
         # 计算插值
@@ -247,75 +274,86 @@ class CFMFlowCFG(BaseFlow):
         mask = mask.unsqueeze(-1)  # [batch_size, 63, 1]
         
         # =============== 等变性感知的晶格损失 ===============
-        lattice_pred = v_pred[:, :3]  # [batch_size, 3, 3]
-        lattice_target = v_target[:, :3]  # [batch_size, 3, 3]
+        lattice_v_pred = v_pred[:, :3]  # [batch_size, 3, 3]
+        lattice_v_target = v_target[:, :3]  # [batch_size, 3, 3]
         
-        if torch.isnan(lattice_pred).any() or torch.isinf(lattice_pred).any():
-            lattice_loss = torch.tensor(1.0, device=device, requires_grad=True)
-            lattice_velocity_loss = torch.tensor(0.0, device=device)
-            invariant_loss = torch.tensor(0.0, device=device)
-            invariant_metrics = {'volume_loss': 0.0, 'lengths_loss': 0.0, 'angles_loss': 0.0, 'total_invariant': 0.0}
-        else:
-            # 原始速度场损失
-            lattice_velocity_loss = F.smooth_l1_loss(lattice_pred, lattice_target, beta=1.0)
-            
-            # 等变性不变量损失  
-            invariant_loss, invariant_metrics = self.compute_invariant_loss(
-                lattice_pred, lattice_target, weight=self.invariant_loss_weight
-            )
-            
-            # 组合晶格损失
-            lattice_loss = lattice_velocity_loss + invariant_loss
+        # 晶格损失：直接计算MSE，因为晶格参数不需要周期性边界条件
+        lattice_velocity_loss = F.smooth_l1_loss(lattice_v_pred, lattice_v_target, beta=2.5)
         
-        # 计算坐标损失（考虑周期性边界条件）
-        # 注意：这里计算的是速度场的损失，而速度场v = x1 - x0
-        # 当x1和x0都是分数坐标时，它们的差值也需要考虑周期性
-        
+        # =============== 坐标损失（考虑周期性边界条件）===============
         # 分离出坐标部分的速度场
         coords_v_pred = v_pred[:, 3:]  # [batch_size, 60, 3]
         coords_v_target = v_target[:, 3:]  # [batch_size, 60, 3]
         
-        # 对于速度场，我们需要确保预测的速度指向正确的方向
-        # 考虑周期性：如果目标速度穿过边界，预测速度也应该穿过边界
-        coords_diff = coords_v_pred - coords_v_target
+        # 周期性边界处理：
+        # 分数坐标归一化后，[0,1] → [mean-std/2, mean+std/2]
+        # 但周期性的本质不变，只是尺度改变了
+        # 速度场 v = x1 - x0，考虑最短路径
         
-        # 应用周期性修正：将差值映射到[-0.5, 0.5]范围
-        # 这确保我们总是计算最短路径的差异
-        coords_diff = coords_diff - torch.round(coords_diff)
+        # 计算速度场的差异
+        coords_v_diff = coords_v_pred - coords_v_target
         
-        # 应用mask并计算损失
-        coords_diff = coords_diff * mask[:, 3:]
-        coords_sq_error = (coords_diff ** 2).sum(dim=-1)  # [batch_size, 60]
+        # 获取归一化后的周期（对应原始空间的1.0）
+        # 如果std是标准差，那么归一化后的周期长度就是 1.0/std
+        device = coords_v_diff.device
+        if self.normalizer.normalize_frac_coords:
+            # 归一化后的周期长度 = 原始周期(1.0) / std
+            frac_std = self.normalizer.frac_std.to(device).view(1, 1, 3)  # [1, 1, 3]
+            period = 1.0 / (frac_std + 1e-6)  # 归一化空间中的周期
+            
+            # 将差值映射到最短路径（[-period/2, period/2]）
+            coords_v_diff = coords_v_diff - torch.round(coords_v_diff / period) * period
+        else:
+            # 如果没有归一化，使用原始的周期性处理
+            print("Warning: 没有归一化，使用原始的周期性处理")
+            coords_v_diff = coords_v_diff - torch.round(coords_v_diff)
         
-        # 计算平均损失
-        valid_atoms = mask[:, 3:, 0].sum(dim=1)  # [batch_size]
-        coords_loss = (coords_sq_error.sum(dim=1) / torch.clamp(valid_atoms * 3, min=1.0)).mean()
+        # 使用修正后的目标计算损失
+        coords_v_target_corrected = coords_v_pred - coords_v_diff
         
-        # 总损失（移除人为限制，让我们看到真实的损失值）
-        loss = self.loss_weight_lattice * lattice_loss + self.loss_weight_coords * coords_loss
+        # 使用reduction='none'以便手动应用mask
+        coords_velocity_loss_unreduced = F.smooth_l1_loss(
+            coords_v_pred, 
+            coords_v_target_corrected,
+            beta=2.5,
+            reduction='none'
+        )  # [batch_size, 60, 3]
+        
+        # 应用mask排除padding
+        coords_mask = mask[:, 3:]  # [batch_size, 60, 1]
+        masked_coords_loss = coords_velocity_loss_unreduced * coords_mask  # [batch_size, 60, 3]
+        
+        # 计算每个样本的平均损失
+        valid_atoms = coords_mask.sum(dim=[1, 2])  # [batch_size] - 总的有效维度数
+        coords_velocity_loss = masked_coords_loss.sum(dim=[1, 2]) / (valid_atoms + 1e-6)  # [batch_size]
+        coords_velocity_loss = coords_velocity_loss.mean()  # 标量
+        
+        # 总损失
+        v_loss = self.loss_weight_lattice * lattice_velocity_loss + self.loss_weight_coords * coords_velocity_loss
         
         # 记录原始损失值用于调试
-        original_loss = loss.item() if not torch.isnan(loss) else float('inf')
+        original_loss = v_loss.item() if not torch.isnan(v_loss) else float('inf')
         
         # 只在极端情况下进行截断，避免梯度爆炸
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: NaN/Inf loss detected! lattice_loss={lattice_loss.item():.4f}, coords_loss={coords_loss.item():.4f}")
-            loss = torch.tensor(10.0, device=device, requires_grad=True)
-        elif loss > 100.0:  # 提高阈值，让我们看到真实的损失
+        if torch.isnan(v_loss) or torch.isinf(v_loss):
+            print(f"Warning: NaN/Inf loss detected! lattice_loss={lattice_velocity_loss.item():.4f}, coords_loss={coords_velocity_loss.item():.4f}")
+            v_loss = torch.tensor(10.0, device=device, requires_grad=True)
+        elif v_loss > 100.0:  # 提高阈值，让我们看到真实的损失
             print(f"Warning: Very high loss={original_loss:.4f}")
-            loss = torch.clamp(loss, max=100.0)
+            v_loss = torch.clamp(v_loss, max=100.0)
         
         # 计算指标
         with torch.no_grad():
-            v_pred_norm = torch.norm(v_pred * mask, dim=-1).mean()
-            v_target_norm = torch.norm(v_target * mask, dim=-1).mean()
-            
             # 计算相对误差
-            # 直接计算整体误差，不分开处理
             v_error = v_pred - v_target
             
-            # 对坐标部分应用周期性修正
-            v_error[:, 3:] = v_error[:, 3:] - torch.round(v_error[:, 3:])
+            # 对坐标部分应用周期性修正（与损失计算保持一致）
+            if self.normalizer.normalize_frac_coords:
+                frac_std = self.normalizer.frac_std.to(device).view(1, 1, 3)
+                period = 1.0 / (frac_std + 1e-6)
+                v_error[:, 3:] = v_error[:, 3:] - torch.round(v_error[:, 3:] / period) * period
+            else:
+                v_error[:, 3:] = v_error[:, 3:] - torch.round(v_error[:, 3:])
             
             # 计算误差范数
             v_error_norm = torch.norm(v_error * mask, dim=-1)
@@ -329,22 +367,16 @@ class CFMFlowCFG(BaseFlow):
                 relative_error = torch.tensor(0.0, device=device)
         
         metrics = {
-            'loss': loss.item(),
-            'lattice_loss': lattice_loss.item(),
+            'loss': v_loss.item(),
             'lattice_velocity_loss': lattice_velocity_loss.item(),
-            'lattice_invariant_loss': invariant_loss.item(),
-            'coords_loss': coords_loss.item(),
-            'v_pred_norm': v_pred_norm.item(),
-            'v_target_norm': v_target_norm.item(),
-            'relative_error': relative_error.item(),
+            'coords_velocity_loss': coords_velocity_loss.item(),
             't_mean': t.mean().item(),
             'sigma_mean': sigma_t.mean().item() if sigma_t.numel() > 0 else 0.0,  # 监控噪声水平
-            'original_loss': original_loss if 'original_loss' in locals() else loss.item(),  # 记录未截断的损失
-            # 新增的不变量详细指标
-            **{f'lattice_{k}': v for k, v in invariant_metrics.items()}
+            'original_loss': original_loss,  # 记录未截断的损失
+            'relative_error': relative_error.item() if 'relative_error' in locals() else 0.0,
         }
         
-        return loss, metrics
+        return v_loss, metrics
     
     def sample(
         self, 
@@ -383,7 +415,19 @@ class CFMFlowCFG(BaseFlow):
         batch_size = conditions['pxrd'].shape[0]
         
         # 初始化噪声（归一化空间）
-        x = torch.randn(batch_size, 63, 3, device=device) * temperature * self.sigma_max
+        # 分别处理晶格参数和分数坐标
+        x = torch.zeros(batch_size, 63, 3, device=device)
+        
+        # 晶格参数：使用标准正态分布
+        x[:, :3, :] = torch.randn(batch_size, 3, 3, device=device) * temperature * self.sigma_max
+        
+        # 分数坐标：使用Wrapped Normal先验分布
+        # 这确保了初始采样就遵循周期性边界条件
+        frac_coords_init = self.sample_wrapped_normal_normalized(
+            shape=(batch_size, 60, 3),
+            device=device
+        )
+        x[:, 3:, :] = frac_coords_init * temperature * self.sigma_max
         
         # 时间步
         dt = 1.0 / num_steps
@@ -426,7 +470,10 @@ class CFMFlowCFG(BaseFlow):
                 trajectory.append(x.clone())
         
         # 反归一化到物理空间
-        x = self.normalizer.denormalize_z(x)
+        # 将x包装成字典格式以使用denormalize方法
+        batch = {'z': x}
+        batch = self.normalizer.denormalize(batch, inplace=False)
+        x = batch['z']
         
         # 后处理：确保分数坐标在[0, 1]范围（应用周期性边界条件）
         # 使用模运算将任何超出[0,1]的坐标映射回正确范围

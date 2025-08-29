@@ -19,7 +19,7 @@ config:
   default_num_steps: 50
   
   # 归一化配置
-  stats_file: data/lattice_stats.json
+  stats_file: raw_data/lattice_stats.json
   normalize_lattice: true
-  normalize_frac_coords: false
+  normalize_frac_coords: true  # 启用分数坐标归一化
   use_global_stats: true

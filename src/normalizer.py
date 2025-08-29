@@ -23,7 +23,7 @@ class DataNormalizer:
         self,
         stats_file: Optional[str] = None,
         normalize_lattice: bool = True,
-        normalize_frac_coords: bool = False,
+        normalize_frac_coords: bool = True,
         use_global_stats: bool = True
     ):
         """
@@ -39,15 +39,6 @@ class DataNormalizer:
         self.normalize_frac_coords = normalize_frac_coords
         self.use_global_stats = use_global_stats
         
-        # 默认统计值（基于 merged_cdvae_total.pkl 计算，全部74310样本）
-        # self.default_stats = {
-        #     'lattice_global_mean': 0.5582,
-        #     'lattice_global_std': 3.3490,
-        #     'lattice_mean': [1.8232, 0.3099, 0.0494, -0.1238, 2.0166, -0.3753, -0.4834, 0.8804, 0.9270],
-        #     'lattice_std': [2.7895, 2.6121, 1.8521, 2.3274, 3.7704, 1.9673, 2.4782, 2.7006, 6.2662],
-        #     'frac_coords_mean': [0.4454, 0.4369, 0.4450],
-        #     'frac_coords_std': [0.2938, 0.2935, 0.2940]
-        # }
         
         # 加载统计信息
         if stats_file and Path(stats_file).exists():
@@ -67,9 +58,7 @@ class DataNormalizer:
                 self.lattice_mean = torch.tensor(self.stats['lattice_global_mean'], dtype=torch.float32)
                 self.lattice_std = torch.tensor(self.stats['lattice_global_std'], dtype=torch.float32)
             else:
-                # 使用分维度mean/std
-                self.lattice_mean = torch.tensor(self.stats['lattice_mean'], dtype=torch.float32).reshape(3, 3)
-                self.lattice_std = torch.tensor(self.stats['lattice_std'], dtype=torch.float32).reshape(3, 3)
+                raise ValueError("分维度归一化不支持")
         
         if self.normalize_frac_coords:
             self.frac_mean = torch.tensor(self.stats['frac_coords_mean'], dtype=torch.float32)
@@ -102,9 +91,7 @@ class DataNormalizer:
                 safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
                 batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / safe_std
             else:
-                # 分维度归一化：每个晶格参数使用独立的mean/std
-                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
-                batch['z'][:, :3, :] = (batch['z'][:, :3, :] - self.lattice_mean.to(device)) / safe_std
+                raise ValueError("分维度归一化不支持")
             
             # 分数坐标归一化（如果需要）
             if self.normalize_frac_coords:
@@ -149,61 +136,6 @@ class DataNormalizer:
         
         return batch
     
-    def normalize_z(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        仅归一化z张量（便捷方法）
-        
-        Args:
-            z: 原始z张量 [batch, 63, 3]
-            
-        Returns:
-            归一化的z张量
-        """
-        z_norm = z.clone()
-        device = z.device
-        
-        if self.normalize_lattice:
-            if self.use_global_stats:
-                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
-                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / safe_std
-            else:
-                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
-                z_norm[:, :3, :] = (z[:, :3, :] - self.lattice_mean.to(device)) / safe_std
-            
-            if self.normalize_frac_coords:
-                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
-                z_norm[:, 3:, :] = (z[:, 3:, :] - self.frac_mean.to(device)) / safe_frac_std
-        
-        return z_norm
-    
-    def denormalize_z(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        仅反归一化z张量（便捷方法）
-        
-        用于采样后的后处理，将归一化空间的结果转换回物理空间
-        
-        Args:
-            z: 归一化的z张量 [batch, 63, 3]
-            
-        Returns:
-            反归一化的z张量（物理空间）
-        """
-        z_denorm = z.clone()
-        device = z.device
-        
-        if self.normalize_lattice:
-            if self.use_global_stats:
-                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
-                z_denorm[:, :3, :] = z[:, :3, :] * safe_std + self.lattice_mean.to(device)
-            else:
-                safe_std = torch.clamp(self.lattice_std.to(device), min=1e-6)
-                z_denorm[:, :3, :] = z[:, :3, :] * safe_std + self.lattice_mean.to(device)
-            
-            if self.normalize_frac_coords:
-                safe_frac_std = torch.clamp(self.frac_std.to(device), min=1e-6)
-                z_denorm[:, 3:, :] = z[:, 3:, :] * safe_frac_std + self.frac_mean.to(device)
-        
-        return z_denorm
     
     def compute_stats_from_dataset(self, dataset, num_samples: Optional[int] = None) -> Dict:
         """

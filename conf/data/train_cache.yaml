@@ -1,11 +1,11 @@
 # 标准训练数据配置 - 使用缓存数据
-train_path: data/train_cache
-val_path: data/val_cache
+train_path: raw_data/train_cache
+val_path: raw_data/val_cache
 test_path: null
 
 # 数据加载配置
 batch_size: 32
-num_workers: 16
+num_workers: 32
 pin_memory: true
 persistent_workers: true
 

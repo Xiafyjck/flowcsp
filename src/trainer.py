@@ -104,12 +104,12 @@ class CrystalGenerationModule(pl.LightningModule):
         # 记录其他指标
         for key, value in metrics.items():
             if key != 'loss':  # 避免重复记录loss
-                self.log(f'train/{key}', value, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f'train/{key}', value, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         # 每100步记录学习率
         if batch_idx % 100 == 0:
             lr = self.optimizers().param_groups[0]['lr']
-            self.log('train/lr', lr, on_step=True, on_epoch=False, sync_dist=True)
+            self.log('train/lr', lr, on_step=True, on_epoch=False, sync_dist=True, batch_size=batch['z'].shape[0])
         
         # 保存输出用于epoch结束时的汇总
         self.training_step_outputs.append({
@@ -135,7 +135,7 @@ class CrystalGenerationModule(pl.LightningModule):
         
         for key, value in metrics.items():
             if key != 'loss':
-                self.log(f'val/{key}', value, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f'val/{key}', value, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         # 保存输出
         self.validation_step_outputs.append({
@@ -159,11 +159,11 @@ class CrystalGenerationModule(pl.LightningModule):
         loss, metrics = self.flow.compute_loss(batch)
         
         # 记录指标
-        self.log('test/loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('test/loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         for key, value in metrics.items():
             if key != 'loss':
-                self.log(f'test/{key}', value, on_step=False, on_epoch=True, sync_dist=True)
+                self.log(f'test/{key}', value, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch['z'].shape[0])
         
         # 生成样本并评估
         if batch_idx < 3:  # 只对前几个批次生成样本
@@ -392,6 +392,9 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         so3_augment_prob: float = 0.5,
         pin_memory: bool = True,
         persistent_workers: bool = True,
+        use_gnn_dataloader: bool = False,  # 是否使用GNN数据加载器
+        gnn_radius: float = 6.0,  # GNN图构建半径
+        gnn_max_neighbors: int = 50,  # GNN最大邻居数
         **dataset_kwargs
     ):
         """
@@ -425,6 +428,9 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         self.so3_augment_prob = so3_augment_prob
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers
+        self.use_gnn_dataloader = use_gnn_dataloader
+        self.gnn_radius = gnn_radius
+        self.gnn_max_neighbors = gnn_max_neighbors
         self.dataset_kwargs = dataset_kwargs
     
     def setup(self, stage: Optional[str] = None):
@@ -439,11 +445,32 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
     
     def train_dataloader(self):
         """创建训练数据加载器"""
-        return get_dataloader(
-            self.train_path,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
+        if self.use_gnn_dataloader:
+            # 使用GNN数据加载器
+            from .gnn_data import get_gnn_dataloader
+            return get_gnn_dataloader(
+                self.train_path,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                augment_permutation=self.augment_permutation,
+                augment_so3=self.augment_so3,
+                augment_prob=self.augment_prob,
+                so3_augment_prob=self.so3_augment_prob,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers,
+                cache_in_memory=True,
+                drop_last=True,
+                build_graph_cache=True,  # 先不构建缓存，动态生成
+                **self.dataset_kwargs
+            )
+        else:
+            # 使用标准数据加载器
+            return get_dataloader(
+                self.train_path,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             augment_permutation=self.augment_permutation,
@@ -455,10 +482,12 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
     
     def val_dataloader(self):
         """创建验证数据加载器"""
-        if self.val_path is None:
-            # 如果没有单独的验证集，使用训练集但不打乱
-            return get_dataloader(
-                self.train_path,
+        if self.use_gnn_dataloader:
+            # 使用GNN数据加载器
+            from .gnn_data import get_gnn_dataloader
+            val_path = self.val_path if self.val_path else self.train_path
+            return get_gnn_dataloader(
+                val_path,
                 batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
@@ -466,34 +495,69 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
                 persistent_workers=self.persistent_workers,
                 augment_permutation=False,  # 验证时不使用数据增强
                 augment_so3=False,
+                cache_in_memory=True,
+                drop_last=True,
+                build_graph_cache=True,  # 先不构建缓存，动态生成
                 **self.dataset_kwargs
             )
-        
-        return get_dataloader(
-            self.val_path,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            augment_permutation=False,
-            augment_so3=False,
-            drop_last=True,  # 丢弃最后的不完整批次，避免批次大小不一致的警告
-            **self.dataset_kwargs
-        )
+        else:
+            # 使用标准数据加载器
+            if self.val_path is None:
+                # 如果没有单独的验证集，使用训练集但不打乱
+                return get_dataloader(
+                    self.train_path,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    num_workers=self.num_workers,
+                    pin_memory=self.pin_memory,
+                    persistent_workers=self.persistent_workers,
+                    augment_permutation=False,  # 验证时不使用数据增强
+                    augment_so3=False,
+                    **self.dataset_kwargs
+                )
+            
+            return get_dataloader(
+                self.val_path,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers,
+                augment_permutation=False,
+                augment_so3=False,
+                drop_last=True,  # 丢弃最后的不完整批次，避免批次大小不一致的警告
+                **self.dataset_kwargs
+            )
     
     def test_dataloader(self):
         """创建测试数据加载器"""
         if self.test_path is None:
             return None
         
-        return get_dataloader(
-            self.test_path,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            augment_permutation=False,  # 测试时不使用数据增强
-            augment_so3=False,
-            **self.dataset_kwargs
-        )
+        if self.use_gnn_dataloader:
+            # 使用GNN数据加载器
+            from .gnn_data import get_gnn_dataloader
+            return get_gnn_dataloader(
+                self.test_path,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                augment_permutation=False,  # 测试时不使用数据增强
+                augment_so3=False,
+                cache_in_memory=True,
+                build_graph_cache=True,  # 先不构建缓存，动态生成
+                **self.dataset_kwargs
+            )
+        else:
+            # 使用标准数据加载器
+            return get_dataloader(
+                self.test_path,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                augment_permutation=False,  # 测试时不使用数据增强
+                augment_so3=False,
+                **self.dataset_kwargs
+            )

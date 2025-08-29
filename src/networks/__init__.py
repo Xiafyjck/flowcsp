@@ -96,6 +96,11 @@ def _register_networks():
         from .crystal_transformer_v2 import CrystalTransformerV2
     except ImportError:
         pass
+    
+    try:
+        from .diffcsp import DiffCSPNetwork
+    except ImportError:
+        pass
 
 
 _register_networks()

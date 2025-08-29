@@ -2,9 +2,9 @@
 name: crystal_transformer_v2
 
 config:
-  hidden_dim: 768
-  num_layers: 12
-  num_heads: 12
+  hidden_dim: 640
+  num_layers: 9
+  num_heads: 10
   dropout: 0.1
   max_atoms: 60
   pxrd_dim: 11501
