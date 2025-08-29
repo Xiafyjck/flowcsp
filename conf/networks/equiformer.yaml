@@ -1,0 +1,22 @@
+# Equiformer 网络配置 - 等变图注意力Transformer
+name: equiformer
+
+config:
+  # 基础网络参数
+  max_atoms: 60              # 最大原子数
+  hidden_channels: 128       # 隐藏通道数
+  num_layers: 6              # Equiformer块的层数
+  num_heads: 8               # 注意力头数
+  
+  # 球谐函数和不可约表示
+  lmax: 2                    # 球谐函数的最大阶数
+  
+  # 图构建参数
+  max_radius: 10.0           # 图构建的最大半径 (Angstrom)
+  num_basis: 128             # 径向基函数的数量
+  
+  # PXRD编码器参数
+  pxrd_dim: 11501            # PXRD谱图维度
+  
+  # MatScholar嵌入路径
+  matscholar_path: src/networks/matscholar.json

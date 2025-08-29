@@ -118,7 +118,7 @@ def setup_callbacks(cfg: DictConfig, checkpoint_dir: Path, use_wandb: bool = Fal
     # 检查点回调
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename='epoch={epoch:03d}-val_loss={val/loss:.4f}',
+        filename='epoch_{epoch:03d}-val_loss_{val_loss:.4f}',
         monitor=cfg.checkpoint.monitor,
         mode=cfg.checkpoint.mode,
         save_top_k=cfg.checkpoint.save_top_k,
@@ -302,8 +302,8 @@ def main(cfg: DictConfig) -> None:
     console.print(f"   约 {total_params/1e6:.1f}M 参数")
     
     # 创建数据模块（使用绝对路径）
-    # 如果使用diffcsp网络，自动启用GNN数据加载器
-    use_gnn_dataloader = (cfg.networks.name == 'diffcsp')
+    # 如果使用diffcsp或equiformer网络，自动启用GNN数据加载器
+    use_gnn_dataloader = (cfg.networks.name in ['diffcsp', 'equiformer'])
     
     data_module = CrystalGenerationDataModule(
         train_path=str(Path(orig_cwd) / cfg.data.train_path),
@@ -318,7 +318,7 @@ def main(cfg: DictConfig) -> None:
         pin_memory=cfg.data.get('pin_memory', True),
         persistent_workers=cfg.data.get('persistent_workers', True),
         use_gnn_dataloader=use_gnn_dataloader,
-        gnn_radius=cfg.networks.config.get('cutoff', 6.0) if use_gnn_dataloader else 6.0,
+        gnn_radius=cfg.networks.config.get('cutoff', cfg.networks.config.get('max_radius', 6.0)) if use_gnn_dataloader else 6.0,
         gnn_max_neighbors=cfg.networks.config.get('max_neighbors', 50) if use_gnn_dataloader else 50,
     )
     

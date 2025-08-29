@@ -28,6 +28,8 @@ dependencies = [
     "torchcfm>=1.0.7",
     "msgpack>=1.1.1",
     "msgpack-numpy>=0.4.8",
+    "ase>=3.26.0",
+    "chgnet>=0.4.0",
 ]
 
 [tool.uv.sources]

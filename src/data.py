@@ -50,7 +50,7 @@ class SO3Augmentation:
         device = batch['z'].device
         
         for i in range(batch_size):
-            if torch.rand(1).item() > self.augment_prob:
+            if torch.rand(1, device=device).item() > self.augment_prob:
                 continue
             
             # 生成随机SO(3)旋转矩阵
@@ -93,7 +93,7 @@ class PermutationAugmentation:
         device = batch['z'].device
         
         for i in range(batch_size):
-            if torch.rand(1).item() > self.augment_prob:
+            if torch.rand(1, device=device).item() > self.augment_prob:
                 continue
             
             num_atoms = int(batch['num_atoms'][i].item())
@@ -335,7 +335,8 @@ class CrystalDataset(Dataset):
 def collate_crystal_batch(
     batch, 
     permutation_aug: Optional[PermutationAugmentation] = None,
-    so3_aug: Optional[SO3Augmentation] = None
+    so3_aug: Optional[SO3Augmentation] = None,
+    device: Optional[torch.device] = None
 ):
     """
     自定义批处理函数，包含数据增强
@@ -344,6 +345,7 @@ def collate_crystal_batch(
         batch: 数据集返回的字典列表
         permutation_aug: 可选的置换增强
         so3_aug: 可选的SO3旋转增强
+        device: 目标设备，如果为None则自动检测CUDA设备
     
     Returns:
         批处理后的字典
@@ -355,6 +357,18 @@ def collate_crystal_batch(
     num_atoms = torch.stack([item['num_atoms'] for item in batch])
     atom_types = torch.stack([item['atom_types'] for item in batch])
     ids = [item['id'] for item in batch]
+    
+    # 自动检测设备：如果device为None，检测CUDA可用性
+    if device is None and torch.cuda.is_available():
+        device = torch.device('cuda')
+    
+    # 如果指定了设备，将数据移动到该设备
+    if device is not None:
+        z = z.to(device, non_blocking=True)
+        comp = comp.to(device, non_blocking=True)
+        pxrd = pxrd.to(device, non_blocking=True)
+        num_atoms = num_atoms.to(device, non_blocking=True)
+        atom_types = atom_types.to(device, non_blocking=True)
     
     collated_batch = {
         'z': z,
@@ -389,6 +403,7 @@ def get_dataloader(
     so3_augment_prob: float = 0.5,
     cache_in_memory: bool = False,
     drop_last: bool = False,
+    device: Optional[torch.device] = None,
     **dataset_kwargs
 ) -> DataLoader:
     """
@@ -406,6 +421,7 @@ def get_dataloader(
         so3_augment_prob: SO3增强概率
         cache_in_memory: 是否将数据缓存到内存
         drop_last: 是否丢弃最后一个不完整的批次
+        device: 目标设备，如果为None则自动检测CUDA设备，确保数据增强在正确设备上进行
         **dataset_kwargs: 传递给CrystalDataset的额外参数
     
     Returns:
@@ -426,7 +442,8 @@ def get_dataloader(
         return collate_crystal_batch(
             batch, 
             permutation_aug=permutation_aug,
-            so3_aug=so3_aug
+            so3_aug=so3_aug,
+            device=device
         )
     
     # 创建DataLoader

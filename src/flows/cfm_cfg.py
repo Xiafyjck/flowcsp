@@ -50,7 +50,7 @@ class CFMFlowCFG(BaseFlow):
         self.invariant_loss_weight = config.get('invariant_loss_weight', 0.01)
         
         # 采样配置
-        self.default_num_steps = config.get('default_num_steps', 50)
+        self.default_num_steps = config.get('default_num_steps', 100)
         
         # 归一化器
         from src.normalizer import DataNormalizer
@@ -144,45 +144,6 @@ class CFMFlowCFG(BaseFlow):
                 shape=shape,
                 device=device
             )
-    
-    @staticmethod
-    def periodic_distance_cdvae(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        使用CDVAE风格的晶格镜像方法计算周期性距离
-        考虑27个可能的镜像位置，找到最短距离
-        
-        Args:
-            x, y: 分数坐标张量 [batch_size, num_atoms, 3]
-            
-        Returns:
-            最短周期性距离的平方 [batch_size, num_atoms, 3]
-        """
-        device = x.device
-        batch_size, num_atoms, _ = x.shape
-        
-        # 将偏移列表移到正确的设备
-        offsets = CFMFlowCFG.OFFSET_LIST.to(device)  # [27, 3]
-        num_images = offsets.shape[0]
-        
-        # 扩展维度以便批处理
-        # x: [batch_size, num_atoms, 1, 3]
-        # y: [batch_size, num_atoms, 1, 3]
-        # offsets: [1, 1, 27, 3]
-        x_expanded = x.unsqueeze(2)  # [batch_size, num_atoms, 1, 3]
-        y_expanded = y.unsqueeze(2)  # [batch_size, num_atoms, 1, 3]
-        offsets_expanded = offsets.view(1, 1, num_images, 3)
-        
-        # 计算所有镜像位置
-        y_images = y_expanded + offsets_expanded  # [batch_size, num_atoms, 27, 3]
-        
-        # 计算到所有镜像的距离
-        diffs = x_expanded - y_images  # [batch_size, num_atoms, 27, 3]
-        distances_sq = diffs ** 2  # [batch_size, num_atoms, 27, 3]
-        
-        # 对每个坐标维度，找到最小距离
-        min_distances_sq, _ = distances_sq.min(dim=2)  # [batch_size, num_atoms, 3]
-        
-        return min_distances_sq
     
     def compute_loss(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
