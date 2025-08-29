@@ -46,6 +46,9 @@ class CFMFlowCFG(BaseFlow):
         self.cfg_prob = config.get('cfg_prob', 0.1)  # 训练时条件dropout概率
         self.cfg_scale = config.get('cfg_scale', 1.5)  # 默认引导强度
         
+        # 不变量损失权重
+        self.invariant_loss_weight = config.get('invariant_loss_weight', 0.01)
+        
         # 采样配置
         self.default_num_steps = config.get('default_num_steps', 50)
         
@@ -114,6 +117,57 @@ class CFMFlowCFG(BaseFlow):
         
         return min_distances_sq
     
+    def compute_invariant_loss(self, lattice_pred, lattice_target, weight=0.1):
+        """
+        计算晶格等变性不变量损失：体积+边长+角度
+        
+        Args:
+            lattice_pred: 预测晶格速度场 [batch_size, 3, 3]
+            lattice_target: 目标晶格速度场 [batch_size, 3, 3] 
+            weight: 不变量损失权重，默认0.1
+            
+        Returns:
+            weighted_loss: 加权后的不变量损失
+            loss_components: 各组件损失字典，用于监控
+        """
+        device = lattice_pred.device
+        
+        # 1. 体积不变量 (行列式)
+        volume_pred = torch.det(lattice_pred)  # [batch_size]
+        volume_target = torch.det(lattice_target)
+        volume_loss = F.mse_loss(volume_pred, volume_target)
+        
+        # 2. 边长不变量 (向量模长)
+        lengths_pred = torch.norm(lattice_pred, dim=-1)  # [batch_size, 3]
+        lengths_target = torch.norm(lattice_target, dim=-1)
+        lengths_loss = F.mse_loss(lengths_pred, lengths_target)
+        
+        # 3. 角度不变量 (余弦相似度)
+        def compute_lattice_angles(lattice):
+            a, b, c = lattice[:, 0], lattice[:, 1], lattice[:, 2]  # [batch_size, 3] each
+            # 计算三个晶格向量间的夹角余弦值
+            cos_alpha = F.cosine_similarity(b, c, dim=-1)  # b与c夹角 (α)
+            cos_beta = F.cosine_similarity(a, c, dim=-1)   # a与c夹角 (β)
+            cos_gamma = F.cosine_similarity(a, b, dim=-1)  # a与b夹角 (γ)
+            return torch.stack([cos_alpha, cos_beta, cos_gamma], dim=-1)  # [batch_size, 3]
+        
+        angles_pred = compute_lattice_angles(lattice_pred)
+        angles_target = compute_lattice_angles(lattice_target)
+        angles_loss = F.mse_loss(angles_pred, angles_target)
+        
+        # 组合总不变量损失
+        total_invariant_loss = volume_loss + lengths_loss + angles_loss
+        weighted_loss = weight * total_invariant_loss
+        
+        # 返回详细指标用于调试
+        loss_components = {
+            'volume_loss': volume_loss.item(),
+            'lengths_loss': lengths_loss.item(),
+            'angles_loss': angles_loss.item(),
+            'total_invariant': total_invariant_loss.item()
+        }
+        
+        return weighted_loss, loss_components
     
     def compute_loss(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
@@ -192,16 +246,26 @@ class CFMFlowCFG(BaseFlow):
             mask[i, 3:3+n] = 1.0  # 有效原子
         mask = mask.unsqueeze(-1)  # [batch_size, 63, 1]
         
-        # 计算晶格损失（改进的损失计算）
-        lattice_pred = v_pred[:, :3]
-        lattice_target = v_target[:, :3]
+        # =============== 等变性感知的晶格损失 ===============
+        lattice_pred = v_pred[:, :3]  # [batch_size, 3, 3]
+        lattice_target = v_target[:, :3]  # [batch_size, 3, 3]
         
         if torch.isnan(lattice_pred).any() or torch.isinf(lattice_pred).any():
             lattice_loss = torch.tensor(1.0, device=device, requires_grad=True)
+            lattice_velocity_loss = torch.tensor(0.0, device=device)
+            invariant_loss = torch.tensor(0.0, device=device)
+            invariant_metrics = {'volume_loss': 0.0, 'lengths_loss': 0.0, 'angles_loss': 0.0, 'total_invariant': 0.0}
         else:
-            # 使用平滑的L1损失代替MSE，对异常值更鲁棒
-            lattice_loss = F.smooth_l1_loss(lattice_pred, lattice_target, beta=1.0)
-            # 移除硬性截断，让损失自然收敛
+            # 原始速度场损失
+            lattice_velocity_loss = F.smooth_l1_loss(lattice_pred, lattice_target, beta=1.0)
+            
+            # 等变性不变量损失  
+            invariant_loss, invariant_metrics = self.compute_invariant_loss(
+                lattice_pred, lattice_target, weight=self.invariant_loss_weight
+            )
+            
+            # 组合晶格损失
+            lattice_loss = lattice_velocity_loss + invariant_loss
         
         # 计算坐标损失（考虑周期性边界条件）
         # 注意：这里计算的是速度场的损失，而速度场v = x1 - x0
@@ -267,6 +331,8 @@ class CFMFlowCFG(BaseFlow):
         metrics = {
             'loss': loss.item(),
             'lattice_loss': lattice_loss.item(),
+            'lattice_velocity_loss': lattice_velocity_loss.item(),
+            'lattice_invariant_loss': invariant_loss.item(),
             'coords_loss': coords_loss.item(),
             'v_pred_norm': v_pred_norm.item(),
             'v_target_norm': v_target_norm.item(),
@@ -274,6 +340,8 @@ class CFMFlowCFG(BaseFlow):
             't_mean': t.mean().item(),
             'sigma_mean': sigma_t.mean().item() if sigma_t.numel() > 0 else 0.0,  # 监控噪声水平
             'original_loss': original_loss if 'original_loss' in locals() else loss.item(),  # 记录未截断的损失
+            # 新增的不变量详细指标
+            **{f'lattice_{k}': v for k, v in invariant_metrics.items()}
         }
         
         return loss, metrics

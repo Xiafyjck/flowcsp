@@ -98,9 +98,73 @@ def sample_merge_csvs(
             console.print("[red]错误: 所有文件都是空的[/red]")
             return
         
-        # 计算每个文件应该抽样的数量（按比例分配）
+        # 计算每个文件应该抽样的数量（按比例分配，确保总数精确）
         actual_total_samples = min(total_samples, total_rows)
         console.print(f"[yellow]总行数: {total_rows}, 目标抽样数: {actual_total_samples}[/yellow]")
+        
+        # 智能分配算法：平衡比例公平和文件覆盖
+        file_allocations = {}
+        non_empty_files = [f for f in csv_files if file_rows.get(f, 0) > 0]
+        
+        if len(non_empty_files) == 0:
+            console.print("[red]错误: 没有非空文件[/red]")
+            return
+            
+        # 策略选择：当样本数 < 文件数时，确保每个文件至少有机会
+        if actual_total_samples < len(non_empty_files):
+            console.print(f"[yellow]样本数({actual_total_samples}) < 文件数({len(non_empty_files)})，启用均匀覆盖模式[/yellow]")
+            
+            # 均匀覆盖模式：每个文件至少1个样本，剩余按比例分配
+            base_per_file = max(1, actual_total_samples // len(non_empty_files))
+            allocated_total = 0
+            
+            for csv_file in non_empty_files:
+                file_allocations[csv_file] = min(base_per_file, file_rows[csv_file])
+                allocated_total += file_allocations[csv_file]
+            
+            # 分配剩余样本给大文件
+            remaining_samples = actual_total_samples - allocated_total
+            if remaining_samples > 0:
+                # 按文件大小排序，给大文件分配剩余样本
+                large_files = sorted(non_empty_files, key=lambda f: file_rows[f], reverse=True)
+                for i in range(min(remaining_samples, len(large_files))):
+                    csv_file = large_files[i % len(large_files)]
+                    if file_allocations[csv_file] < file_rows[csv_file]:
+                        file_allocations[csv_file] += 1
+                        
+        else:
+            console.print(f"[cyan]样本数({actual_total_samples}) >= 文件数({len(non_empty_files)})，启用比例分配模式[/cyan]")
+            
+            # 比例分配模式：严格按文件大小比例分配
+            allocated_total = 0
+            remainders = []
+            
+            for csv_file in non_empty_files:
+                exact_allocation = actual_total_samples * file_rows[csv_file] / total_rows
+                base_allocation = int(exact_allocation)
+                remainder = exact_allocation - base_allocation
+                
+                file_allocations[csv_file] = base_allocation
+                allocated_total += base_allocation
+                remainders.append((csv_file, remainder))
+            
+            # 分配剩余样本给余数最大的文件
+            remaining_samples = actual_total_samples - allocated_total
+            remainders.sort(key=lambda x: x[1], reverse=True)
+            
+            for i in range(remaining_samples):
+                if i < len(remainders):
+                    csv_file, _ = remainders[i]
+                    file_allocations[csv_file] += 1
+        
+        # 设置空文件分配为0
+        for csv_file in csv_files:
+            if csv_file not in file_allocations:
+                file_allocations[csv_file] = 0
+        
+        # 验证总数
+        final_total = sum(file_allocations.values())
+        console.print(f"[cyan]分配验证: 期望={actual_total_samples}, 实际分配={final_total}[/cyan]")
         
         # 读取并抽样数据
         task = progress.add_task("[cyan]读取并抽样文件...", total=len(csv_files))
@@ -109,13 +173,8 @@ def sample_merge_csvs(
             try:
                 progress.update(task, description=f"[cyan]处理: {csv_file.name}")
                 
-                # 按总数抽样：按文件大小比例分配
-                if csv_file in file_rows and file_rows[csv_file] > 0:
-                    file_sample_size = int(actual_total_samples * file_rows[csv_file] / total_rows)
-                    # 确保至少抽1个（如果文件不为空）
-                    file_sample_size = max(1, file_sample_size) if file_rows[csv_file] > 0 else 0
-                else:
-                    file_sample_size = 0
+                # 使用精确分配的样本数
+                file_sample_size = file_allocations.get(csv_file, 0)
                 
                 # 读取CSV文件
                 if file_sample_size > 0:

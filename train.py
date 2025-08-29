@@ -62,7 +62,7 @@ def parse_args():
     # 网络参数
     parser.add_argument('--hidden_dim', type=int, default=832,  # 调整为90M参数量
                         help='Hidden dimension for transformer')
-    parser.add_argument('--num_layers', type=int, default=8,  # 保持8层以平衡深度和效率
+    parser.add_argument('--num_layers', type=int, default=10,  # 保持8层以平衡深度和效率
                         help='Number of transformer layers')
     parser.add_argument('--num_heads', type=int, default=8,
                         help='Number of attention heads')
@@ -74,17 +74,19 @@ def parse_args():
                         help='Minimum noise level for CFM')
     parser.add_argument('--sigma_max', type=float, default=1.0,
                         help='Maximum noise level for CFM')
-    parser.add_argument('--loss_weight_lattice', type=float, default=1.0,
+    parser.add_argument('--loss_weight_lattice', type=float, default=8.0,
                         help='Loss weight for lattice parameters')
-    parser.add_argument('--loss_weight_coords', type=float, default=1.0,
+    parser.add_argument('--loss_weight_coords', type=float, default=1.5,
                         help='Loss weight for fractional coordinates')
+    parser.add_argument('--invariant_loss_weight', type=float, default=0.005,
+                        help='Weight for lattice invariant loss (volume+lengths+angles)')
     parser.add_argument('--default_num_steps', type=int, default=50,
                         help='Default number of sampling steps')
     parser.add_argument('--stats_file', type=str, default='data/lattice_stats.json',
                         help='Path to lattice statistics JSON file for normalization')
     
     # 优化器参数
-    parser.add_argument('--lr', type=float, default=1e-4,  # 降低学习率
+    parser.add_argument('--lr', type=float, default=1e-5,  # 降低学习率
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.05,  # 增加权重衰减
                         help='Weight decay')
@@ -211,6 +213,7 @@ def main():
         'sigma_max': args.sigma_max,
         'loss_weight_lattice': args.loss_weight_lattice,
         'loss_weight_coords': args.loss_weight_coords,
+        'invariant_loss_weight': args.invariant_loss_weight,
         'default_num_steps': args.default_num_steps,
         'stats_file': args.stats_file,  # 归一化统计文件路径
     }
