@@ -382,6 +382,7 @@ def get_dataloader(
     shuffle: bool = True,
     num_workers: int = 4,
     pin_memory: bool = True,
+    persistent_workers: bool = False,
     augment_permutation: bool = False,
     augment_so3: bool = False,
     augment_prob: float = 0.5,
@@ -435,6 +436,7 @@ def get_dataloader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
         collate_fn=collate_fn,
         drop_last=drop_last  # 丢弃最后一个不完整的批次（避免批次大小不一致）
     )

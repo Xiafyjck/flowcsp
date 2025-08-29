@@ -1,0 +1,10 @@
+# Crystal Transformer 网络配置
+name: crystal_transformer
+
+config:
+  hidden_dim: 832
+  num_layers: 10
+  num_heads: 8
+  dropout: 0.1
+  max_atoms: 60
+  pxrd_dim: 11501

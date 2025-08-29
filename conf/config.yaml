@@ -1,0 +1,87 @@
+# 主配置文件 - 定义默认配置组合
+defaults:
+  - _self_
+  - networks: crystal_transformer_v2  # 使用新的增强版transformer
+  - flows: cfm_cfg
+  - data: train_cache
+  - override hydra/launcher: basic
+  - override hydra/sweeper: basic
+
+# 实验配置
+experiment:
+  name: null  # 自动生成: {network}_{flow}_{timestamp}
+  seed: 42
+  output_dir: outputs
+
+# 训练配置
+trainer:
+  max_epochs: 500
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 2
+  val_check_interval: 0.5
+  log_every_n_steps: 20
+  precision: "32"
+  deterministic: false
+  
+  # 硬件配置
+  accelerator: gpu
+  devices: -1  # 使用所有可用GPU
+  strategy: auto  # 自动选择策略（单卡或DDP）
+  
+  # 调试选项
+  fast_dev_run: false
+  overfit_batches: 0
+  profile: false
+
+# 优化器配置
+optimizer:
+  type: AdamW
+  lr: 1e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+
+# 学习率调度器配置
+scheduler:
+  type: ReduceLROnPlateau
+  warmup_steps: 2000
+  max_steps: 100000
+  T_max: 100
+  eta_min: 1e-6
+  step_size: 30
+  gamma: 0.1
+  factor: 0.5
+  patience: 10
+  min_lr: 1e-6
+
+# 检查点配置
+checkpoint:
+  save_top_k: 3
+  monitor: val/loss
+  mode: min
+  save_last: true
+  
+# 早停配置
+early_stopping:
+  patience: 30
+  monitor: val/loss
+  mode: min
+
+# EMA配置
+ema:
+  use_ema: true
+  decay: 0.9999
+  update_every: 1
+
+# Hydra配置
+hydra:
+  run:
+    dir: ${experiment.output_dir}/${networks.name}_${flows.name}_${now:%Y%m%d_%H%M%S}
+  sweep:
+    dir: ${experiment.output_dir}/multirun/${now:%Y%m%d_%H%M%S}
+    subdir: ${hydra.job.num}_${networks.name}_${flows.name}
+  job:
+    chdir: true  # 改变到输出目录
+  job_logging:
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'

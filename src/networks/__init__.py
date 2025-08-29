@@ -91,6 +91,11 @@ def _register_networks():
         from .crystal_transformer import CrystalTransformer
     except ImportError:
         pass
+    
+    try:
+        from .crystal_transformer_v2 import CrystalTransformerV2
+    except ImportError:
+        pass
 
 
 _register_networks()

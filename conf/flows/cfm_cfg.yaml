@@ -1,0 +1,25 @@
+# CFM with Classifier-Free Guidance 流模型配置
+name: cfm_cfg
+
+config:
+  # 噪声参数
+  sigma_min: 1e-4
+  sigma_max: 1.0
+  
+  # 损失权重
+  loss_weight_lattice: 5.0  # 降低晶格权重，避免主导损失
+  loss_weight_coords: 1.0
+  invariant_loss_weight: 0.01  # 晶格等变性损失权重
+  
+  # CFG参数
+  cfg_prob: 0.1  # 训练时条件dropout概率
+  cfg_scale: 1.5  # 推理时引导强度
+  
+  # 采样参数
+  default_num_steps: 50
+  
+  # 归一化配置
+  stats_file: data/lattice_stats.json
+  normalize_lattice: true
+  normalize_frac_coords: false
+  use_global_stats: true

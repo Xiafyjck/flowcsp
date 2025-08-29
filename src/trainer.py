@@ -390,6 +390,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         augment_so3: bool = False,
         augment_prob: float = 0.5,
         so3_augment_prob: float = 0.5,
+        pin_memory: bool = True,
+        persistent_workers: bool = True,
         **dataset_kwargs
     ):
         """
@@ -421,6 +423,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
         self.augment_so3 = augment_so3
         self.augment_prob = augment_prob
         self.so3_augment_prob = so3_augment_prob
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
         self.dataset_kwargs = dataset_kwargs
     
     def setup(self, stage: Optional[str] = None):
@@ -440,7 +444,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
             augment_permutation=self.augment_permutation,
             augment_so3=self.augment_so3,
             augment_prob=self.augment_prob,
@@ -457,7 +462,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
                 batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
-                pin_memory=True,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers,
                 augment_permutation=False,  # 验证时不使用数据增强
                 augment_so3=False,
                 **self.dataset_kwargs
@@ -468,7 +474,8 @@ class CrystalGenerationDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
             augment_permutation=False,
             augment_so3=False,
             drop_last=True,  # 丢弃最后的不完整批次，避免批次大小不一致的警告
