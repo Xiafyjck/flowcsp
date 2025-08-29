@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
 from . import BaseFlow, register_flow
+from scipy.optimize import linear_sum_assignment
+import numpy as np
 
 
 @register_flow("cfm_cfg")
@@ -48,6 +50,9 @@ class CFMFlowCFG(BaseFlow):
         
         # 不变量损失权重
         self.invariant_loss_weight = config.get('invariant_loss_weight', 0.01)
+        
+        # 置换不变性开关（默认开启）
+        self.use_permutation_invariance = config.get('use_permutation_invariance', True)
         
         # 采样配置
         self.default_num_steps = config.get('default_num_steps', 100)
@@ -101,6 +106,109 @@ class CFMFlowCFG(BaseFlow):
         wrapped_samples = samples - torch.floor(samples)
         
         return wrapped_samples
+    
+    def reorder_target_by_optimal_assignment(
+        self, 
+        pred_v: torch.Tensor,
+        target_v: torch.Tensor,
+        atom_types: torch.Tensor,
+        num_atoms: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        根据最优匹配重排target速度场的顺序，使其与pred最接近
+        仅对分数坐标部分（索引3:63）进行重排，晶格参数部分（索引0:3）保持不变
+        
+        优化版本：使用张量操作计算成本矩阵，减少Python循环
+        
+        Args:
+            pred_v: 预测的速度场 [batch_size, 63, 3]
+            target_v: 目标速度场 [batch_size, 63, 3]
+            atom_types: 原子类型 [batch_size, 60] (comp字段)
+            num_atoms: 每个样本的原子数 [batch_size]
+            
+        Returns:
+            重排后的target_v（仅分数坐标部分重排，晶格部分不变）
+        """
+        batch_size = pred_v.shape[0]
+        device = pred_v.device
+        # 克隆原始target，保证晶格部分不被改变
+        reordered_target = target_v.clone()
+        
+        # 预计算周期性参数
+        if self.normalizer.normalize_frac_coords:
+            frac_std = self.normalizer.frac_std.to(device)
+            period = 1.0 / (frac_std + 1e-6)
+        else:
+            period = 1.0
+        
+        for i in range(batch_size):
+            n = num_atoms[i].item()
+            if n <= 1:  # 如果只有0或1个原子，不需要重排
+                continue
+                
+            # 获取该样本的原子类型（comp字段）
+            sample_types = atom_types[i, :n]  # [n]
+            
+            # 获取唯一的原子类型（排除0，因为0表示padding）
+            unique_types = torch.unique(sample_types[sample_types > 0])
+            
+            for atom_type in unique_types:
+                # 找出该类型的所有原子索引
+                type_mask = (sample_types == atom_type)
+                type_indices = torch.where(type_mask)[0]
+                
+                n_type = len(type_indices)
+                if n_type <= 1:
+                    # 只有0或1个该类型原子，不需要重排
+                    continue
+                
+                # 获取该类型原子的预测和目标速度场（注意要偏移3，因为前3是晶格）
+                pred_subset = pred_v[i, 3 + type_indices]  # [n_type, 3]
+                target_subset = target_v[i, 3 + type_indices]  # [n_type, 3]
+                
+                # 检查输入是否有效
+                if torch.isnan(pred_subset).any() or torch.isnan(target_subset).any():
+                    print(f"Warning: NaN in input for sample {i}, atom type {atom_type}. Skipping reordering.")
+                    continue
+                
+                # 使用广播计算成本矩阵（张量并行）
+                # pred_subset[:, None, :] 形状 [n_type, 1, 3]
+                # target_subset[None, :, :] 形状 [1, n_type, 3]
+                # diff 形状 [n_type, n_type, 3]
+                diff = pred_subset[:, None, :] - target_subset[None, :, :]
+                
+                # 应用周期性边界条件
+                if self.normalizer.normalize_frac_coords:
+                    diff = diff - torch.round(diff / period) * period
+                else:
+                    diff = diff - torch.round(diff)
+                
+                # 计算L2距离作为成本矩阵 [n_type, n_type]
+                cost_matrix = torch.sum(diff ** 2, dim=-1)
+                
+                # 数值稳定性检查
+                if torch.isnan(cost_matrix).any() or torch.isinf(cost_matrix).any():
+                    # 如果出现NaN或Inf，跳过这个样本的重排
+                    print(f"Warning: NaN/Inf in cost matrix for sample {i}, atom type {atom_type}. Skipping reordering.")
+                    continue
+                
+                # 确保成本矩阵是有限的
+                cost_matrix = torch.clamp(cost_matrix, min=0.0, max=1e10)
+                
+                # 执行匈牙利算法（这部分仍需要CPU）
+                with torch.no_grad():
+                    try:
+                        row_ind, col_ind = linear_sum_assignment(cost_matrix.cpu().numpy())
+                    except ValueError as e:
+                        # 如果匈牙利算法失败，跳过这个样本
+                        print(f"Warning: Hungarian algorithm failed for sample {i}, atom type {atom_type}: {e}")
+                        continue
+                
+                # 批量重排target的顺序（避免Python循环）
+                # 使用高级索引一次性完成重排
+                reordered_target[i, 3 + type_indices[row_ind]] = target_v[i, 3 + type_indices[col_ind]]
+        
+        return reordered_target
     
     def sample_wrapped_normal_normalized(self, shape: tuple, device: torch.device) -> torch.Tensor:
         """
@@ -227,6 +335,20 @@ class CFMFlowCFG(BaseFlow):
         # 通过网络预测速度场
         v_pred = self.network(xt, t, r, conditions)
         
+        # ========== 置换不变性处理：重排目标速度场 ==========
+        # 根据预测和目标的最优匹配，重排v_target中的原子顺序
+        # 这样可以避免相同类型原子顺序不同导致的虚假大损失
+        if self.use_permutation_invariance:
+            v_target_reordered = self.reorder_target_by_optimal_assignment(
+                pred_v=v_pred,
+                target_v=v_target,
+                atom_types=batch['comp'],  # 原子类型信息
+                num_atoms=batch['num_atoms']
+            )
+        else:
+            # 不使用置换不变性，直接使用原始目标
+            v_target_reordered = v_target
+        
         # 创建mask处理padding
         mask = torch.zeros_like(x1[..., 0])  # [batch_size, 63]
         for i, n in enumerate(batch['num_atoms']):
@@ -236,7 +358,7 @@ class CFMFlowCFG(BaseFlow):
         
         # =============== 等变性感知的晶格损失 ===============
         lattice_v_pred = v_pred[:, :3]  # [batch_size, 3, 3]
-        lattice_v_target = v_target[:, :3]  # [batch_size, 3, 3]
+        lattice_v_target = v_target[:, :3]  # [batch_size, 3, 3] - 晶格不需要重排！
         
         # 晶格损失：直接计算MSE，因为晶格参数不需要周期性边界条件
         lattice_velocity_loss = F.smooth_l1_loss(lattice_v_pred, lattice_v_target, beta=2.5)
@@ -244,7 +366,7 @@ class CFMFlowCFG(BaseFlow):
         # =============== 坐标损失（考虑周期性边界条件）===============
         # 分离出坐标部分的速度场
         coords_v_pred = v_pred[:, 3:]  # [batch_size, 60, 3]
-        coords_v_target = v_target[:, 3:]  # [batch_size, 60, 3]
+        coords_v_target = v_target_reordered[:, 3:]  # [batch_size, 60, 3] - 使用重排后的目标
         
         # 周期性边界处理：
         # 分数坐标归一化后，[0,1] → [mean-std/2, mean+std/2]
@@ -305,8 +427,8 @@ class CFMFlowCFG(BaseFlow):
         
         # 计算指标
         with torch.no_grad():
-            # 计算相对误差
-            v_error = v_pred - v_target
+            # 计算相对误差（使用重排后的目标）
+            v_error = v_pred - v_target_reordered
             
             # 对坐标部分应用周期性修正（与损失计算保持一致）
             if self.normalizer.normalize_frac_coords:
@@ -318,7 +440,7 @@ class CFMFlowCFG(BaseFlow):
             
             # 计算误差范数
             v_error_norm = torch.norm(v_error * mask, dim=-1)
-            v_target_norm_masked = torch.norm(v_target * mask, dim=-1)
+            v_target_norm_masked = torch.norm(v_target_reordered * mask, dim=-1)
             
             valid_mask = v_target_norm_masked > 1e-4
             

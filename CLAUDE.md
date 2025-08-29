@@ -2,7 +2,7 @@
 
 ## 设计说明
 
-1. 利用最新的 mean flow 生成框架，[code](docs/repo/meanflow)，[literature](docs/literature/meanflow)
+1. 利用classifier-free guidence condition flow matching 生成框架
 2. 采用等变性模型 equiformer，[code](docs/repo/equiformer)，[literature](docs/literature/equiformer)
 3. 仿真PXRD计算是一个[开源的过程](src/PXRDSimulator.py)
 
@@ -51,12 +51,6 @@
 - uv：python 运行环境管理
 - hydra + python-dotenv: 配置管理
 - pytorch: 训练框架
-- wandb：日志记录
-
-
-## 调参说明
-
-- 我创建了一个[超小数据集](data/small_dataset_1000.pkl)（只有1000个数据点且数据结构和标准数据集一致，所以不用查看里面的具体数据结构）来验证模型是否有过拟合能力，如果模型不能过拟合，那么就是失败的模型
 
 
 
@@ -65,8 +59,6 @@
 - [x] 可能是linux容器的原因，matplot一定不要用中文
 
 - [x] equiformer可能难以构建，因此前期我们先用参数量在150M左右的transformer打通流程
-
-- [ ] meanflow是新的生成框架，有很多技术要点需要看论文，例如怎么使用中间使用的jvp技术和梯度停止技术
 
 - [x] 遇到训练NaN问题，可以用用PyTorch的异常检测定位： torch.autograd.set_detect_anomaly(True) 或环境变量：TORCH_ANOMALY_ENABLED=1
 
@@ -100,12 +92,10 @@
   ├── networks/         # 所有网络定义（独立模块，与其他模块无关）
   │   ├── __init__.py     # 统一接口 + 网络注册机制
   │   ├── readme.md       # 接口文档
-  │   ├── transformer.py  # Transformer实现 + 数据适配
   │   └── equiformer.py   # Equiformer实现 + 数据适配（主要是会涉及到pytorch geometric data）
   ├── flows/           # 所有flows定义（独立模块，与其他模块）
   │   ├── __init__.py   
   │   ├── readme.md       # 接口文档
-  │   ├── meanflow.py    
   │   └── cfm.py          #利用pytorchcfm实现的标准cfm
   ├── trainer.py       # Lightning模块 + 训练逻辑（网络无关，flows无关）
   ├── data.py          # 数据加载（返回原始字典，网络，flows无关）
@@ -135,9 +125,6 @@
   - 采样质量问题 → 检查 flow 的 sample 方法
 
   🚀 快速开始
-
-  - 使用Transformer训练
-  python train_hydra.py --network transformer --flow cfm
 
   - 使用Equiformer训练
   python train_hydra.py --network equiformer --flow meanflow
