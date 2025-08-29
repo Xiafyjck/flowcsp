@@ -7,7 +7,7 @@ config:
   sigma_max: 1.0
   
   # 损失权重
-  loss_weight_lattice: 10.0  # 降低晶格权重，避免主导损失
+  loss_weight_lattice: 3.0  # 降低晶格权重，避免主导损失
   loss_weight_coords: 1.0
   
   # CFG参数
